@@ -31,6 +31,18 @@ module RailsSnippetHarness
       inverse_of: :mock_item
   end
 
+  class MockItemGeo < ApplicationRecord
+    include ParadeDB::Model
+
+    self.table_name = "mock_items_geo"
+  end
+
+  class MockItemPath < ApplicationRecord
+    include ParadeDB::Model
+
+    self.table_name = "mock_items_paths"
+  end
+
   class Order < ApplicationRecord
     include ParadeDB::Model
 
@@ -41,6 +53,14 @@ module RailsSnippetHarness
       class_name: "RailsSnippetHarness::MockItem",
       foreign_key: :product_id,
       inverse_of: :orders
+  end
+
+  class ShopSynonym < ApplicationRecord
+    self.table_name = "shop_synonyms"
+  end
+
+  class Synonym < ApplicationRecord
+    self.table_name = "synonyms"
   end
 
   module_function
@@ -54,3 +74,9 @@ RailsSnippetHarness.establish_connection!
 
 MockItem = RailsSnippetHarness::MockItem
 Order = RailsSnippetHarness::Order
+
+ShopSynonym = RailsSnippetHarness::ShopSynonym
+Synonym = RailsSnippetHarness::Synonym
+
+MockItemGeo = RailsSnippetHarness::MockItemGeo
+MockItemPath = RailsSnippetHarness::MockItemPath

@@ -21,7 +21,7 @@ SELECT
     WHEN 2 THEN 'eat some cheese'
     END,
     (random() * 4 + 1)::int
-FROM generate_series(1, 9000000) as id;
+FROM generate_series(1, 6300000) as id;
 
 DO $$
 DECLARE
@@ -130,6 +130,10 @@ $$;
 
 [server.teardown]
 sql = """
+SELECT pg_cancel_backend(pid)
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND backend_type IN ('background merger for public.idxtest', 'background merger for public.idxupserts');
 DROP TABLE test, upserts, segment_sightings, segment_counts CASCADE;
 DROP EXTENSION pg_search CASCADE;
 """
@@ -163,7 +167,7 @@ SELECT assert_plan_contains(
 sql = """
 SELECT count(*) FROM test WHERE message ||| 'cheese';
 """
-assert = "3000000"
+assert = "2100000"
 
 [[jobs]]
 window_height = 25

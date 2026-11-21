@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Squashes the commit history of the `gh-pages` branch for a specified remote
-# into a single orphan root commit containing the exact current file tree.
+# into a single orphan root commit with compacted query history and bounded HTML report retention.
 #
 # By default, this script runs safely and prints the resulting commit SHA and
 # push command without pushing to any remote. Pass --push to apply the change.
@@ -76,7 +76,23 @@ if ! git rev-parse --verify "$REMOTE_REF" &>/dev/null; then
 fi
 
 OLD_COMMIT=$(git rev-parse "$REMOTE_REF")
-TREE_SHA=$(git rev-parse "${REMOTE_REF}^{tree}")
+# Compact a detached checkout so neither the caller's files nor index are changed.
+COMPACT_WORKTREE=$(mktemp -d)
+cleanup() {
+  git worktree remove --force "$COMPACT_WORKTREE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+git worktree add --detach "$COMPACT_WORKTREE" "$OLD_COMMIT" --quiet
+python3 "$SCRIPT_DIR/compact-benchmark-history.py" "$COMPACT_WORKTREE/benchmarks"
+python3 "$SCRIPT_DIR/prune-benchmark-reports.py" "$COMPACT_WORKTREE"
+if [[ -d "$COMPACT_WORKTREE/benchmarker-runs" ]]; then
+  git -C "$COMPACT_WORKTREE" add -u -- benchmarker-runs
+fi
+# Stage only the migrated query history and its dictionary, when present.
+if [[ -f "$COMPACT_WORKTREE/benchmarks/sql-extras.json" ]]; then
+  git -C "$COMPACT_WORKTREE" add -f benchmarks/data.js benchmarks/sql-extras.json
+fi
+TREE_SHA=$(git -C "$COMPACT_WORKTREE" write-tree)
 TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
 echo "=================================================="
@@ -95,7 +111,7 @@ echo ""
 
 if [[ "$DO_PUSH" == true ]]; then
   echo "Force-pushing squashed commit to $REMOTE/gh-pages..."
-  git push "$REMOTE" "$NEW_COMMIT:refs/heads/gh-pages" --force
+  git push "$REMOTE" "$NEW_COMMIT:refs/heads/gh-pages" --force-with-lease="refs/heads/gh-pages:$OLD_COMMIT"
   echo "Successfully squashed and updated gh-pages on $REMOTE."
 else
   echo "No changes were pushed to $REMOTE."
@@ -104,5 +120,5 @@ else
   echo "  ./.github/scripts/squash-gh-pages.sh --push $REMOTE"
   echo ""
   echo "Or push manually via git:"
-  echo "  git push $REMOTE $NEW_COMMIT:refs/heads/gh-pages --force"
+  echo "  git push $REMOTE $NEW_COMMIT:refs/heads/gh-pages --force-with-lease=refs/heads/gh-pages:$OLD_COMMIT"
 fi

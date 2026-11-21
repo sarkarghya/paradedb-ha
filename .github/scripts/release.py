@@ -7,14 +7,13 @@ Unified release artifact assembler for ParadeDB:
 - Registers new versions in docs navigation and installation examples
 """
 
-# pylint: disable=too-many-lines,fixme
+# pylint: disable=too-many-lines,too-many-locals,fixme
 
 import argparse
 import json
 import re
 import subprocess
 import sys
-from collections import defaultdict, deque
 from pathlib import Path
 from textwrap import dedent
 
@@ -85,6 +84,25 @@ def get_existing_sql_targets(sql_dir):
     return targets
 
 
+def latest_released_sql_version(sql_dir):
+    """Return the newest released version present in this checkout's SQL chain."""
+    released_targets = set(get_git_tags()) & set(get_existing_sql_targets(sql_dir))
+    return max(released_targets, key=parse_semver, default=None)
+
+
+def handle_latest_sql_version_command(args, repo_root):
+    """Print the migration tip, optionally restricted to tagged releases for discovery."""
+    sql_dir = repo_root / "pg_search" / "sql"
+    version = (
+        latest_released_sql_version(sql_dir)
+        if args.released
+        else max(get_existing_sql_targets(sql_dir), key=parse_semver, default=None)
+    )
+    if version is None:
+        sys.exit("Could not find a matching version in the checked-out SQL chain")
+    print(f"v{version}")
+
+
 def resolve_prev_version(repo_root, sql_dir, target_version, explicit_prev):
     """Determine the predecessor version to upgrade from."""
     if explicit_prev:
@@ -121,170 +139,37 @@ def parse_pr_number(filename):
     return 0
 
 
-def parse_depends_on(content):
-    """Parse '-- depends-on: <PR>, ...' or '/* depends-on: ... */' from content."""
-    deps = set()
-    for match in re.finditer(
-        r"(?:--|/\*)\s*depends-on:\s*([0-9#,\s\w.-]+?)(?:\*/|\n|$)",
-        content,
-        re.IGNORECASE,
-    ):
-        raw = match.group(1)
-        for num in re.findall(r"\b\d+\b", raw):
-            deps.add(int(num))
-        for token in raw.split(","):
-            token = token.strip().lstrip("#")
-            if token.endswith(".sql"):
-                deps.add(token)
-    return deps
-
-
-def _build_fragment_dependency_graph(fragments):
-    """Build mapping of fragment -> set of prerequisite fragments."""
-    pr_map = defaultdict(list)
-    name_map = {}
-    for f in fragments:
-        pr_num = parse_pr_number(f.name)
-        if pr_num > 0:
-            pr_map[pr_num].append(f)
-        name_map[f.name] = f
-
-    fragment_deps = defaultdict(set)
-    for f in fragments:
-        try:
-            with open(f, "r", encoding="utf-8") as fp:
-                content = fp.read()
-        except OSError:
-            continue
-        raw_deps = parse_depends_on(content)
-        for dep in raw_deps:
-            if isinstance(dep, int) and dep in pr_map:
-                for target_f in pr_map[dep]:
-                    if target_f != f:
-                        fragment_deps[f].add(target_f)
-            elif isinstance(dep, str) and dep in name_map and name_map[dep] != f:
-                fragment_deps[f].add(name_map[dep])
-
-    return fragment_deps
-
-
-def topological_sort_fragments(fragments):
-    """Topologically sort SQL fragments by their declared dependencies.
-
-    Tiebreaker for independent fragments is (parse_pr_number(f.name), f.name).
-    """
-    fragment_deps = _build_fragment_dependency_graph(fragments)
-
-    in_degree = {f: 0 for f in fragments}
-    dependents = defaultdict(list)
-    for f, deps in fragment_deps.items():
-        for dep in deps:
-            dependents[dep].append(f)
-            in_degree[f] += 1
-
-    def tiebreaker(item):
-        return (parse_pr_number(item.name), item.name)
-
-    queue = deque(sorted([f for f in fragments if in_degree[f] == 0], key=tiebreaker))
-    result = []
-
-    while queue:
-        node = queue.popleft()
-        result.append(node)
-
-        new_ready = []
-        for nxt in dependents[node]:
-            in_degree[nxt] -= 1
-            if in_degree[nxt] == 0:
-                new_ready.append(nxt)
-        for item in sorted(new_ready, key=tiebreaker):
-            queue.append(item)
-
-    if len(result) != len(fragments):
-        unresolved = [f.name for f in fragments if in_degree[f] > 0]
-        print(
-            f"❌ Error: Circular or unresolved dependency among fragments: {unresolved}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    return result
-
-
-def collect_sql_fragments(unreleased_dir):
-    """Collect all *.sql fragments in unreleased dir topologically sorted by dependencies."""
-    if not unreleased_dir.exists():
-        return []
-    fragments = [
-        f for f in unreleased_dir.glob("*.sql") if f.is_file() and f.name != ".gitkeep"
-    ]
-    return topological_sort_fragments(fragments)
-
-
-def format_sql_banner(filename):
-    """Generate section banner for an assembled SQL fragment."""
-    sep = "-- " + "=" * 76
-    return f"\n{sep}\n-- Fragment: {filename}\n{sep}\n"
-
-
-# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
 def assemble_sql_files(
     repo_root,
     target_version,
     prev_version,
     preserve_fragments,
+    *,
     output_dir=None,
     update_control_default=False,
 ):
-    """Assemble SQL fragments into pg_search--<prev>--<target>.sql."""
-    sql_dir = repo_root / "pg_search" / "sql"
-    unreleased_dir = sql_dir / "unreleased"
-    dest_dir = Path(output_dir) if output_dir else sql_dir
-    output_file = dest_dir / f"pg_search--{prev_version}--{target_version}.sql"
-
-    print(
-        f"Assembling SQL upgrade script: {output_file} "
-        f"(from {prev_version} to {target_version})"
-    )
-
-    fragments = collect_sql_fragments(unreleased_dir)
-    print(f"Found {len(fragments)} SQL fragment(s):")
-    for fragment in fragments:
-        print(f"  - {fragment.name}")
-
-    with open(output_file, "w", encoding="utf-8") as out:
-        echo_header = (
-            f"\\echo Use \"ALTER EXTENSION pg_search UPDATE TO '{target_version}'\" "
-            f"to load this file. \\quit\n"
-        )
-        out.write(echo_header)
-        for fragment in fragments:
-            out.write(format_sql_banner(fragment.name))
-            with open(fragment, "r", encoding="utf-8") as fin:
-                out.write(fin.read())
-            out.write("\n")
-
-    print(f"✅ Successfully generated: {output_file}")
-
+    """Delegate SQL assembly and fragment removal to cargo-pgrx."""
+    # pylint: disable=too-many-arguments
+    command = [
+        "cargo",
+        "pgrx",
+        "migrate",
+        "assemble",
+        target_version,
+        "--package",
+        "pg_search",
+        "--prev-version",
+        clean_version(prev_version),
+        "--allow-empty",
+    ]
+    if preserve_fragments:
+        command.append("--preserve-fragments")
+    if output_dir:
+        command.extend(["--output-dir", str(Path(output_dir).resolve())])
     if update_control_default:
-        control_file = dest_dir / "pg_search.control"
-        if control_file.exists():
-            content = control_file.read_text(encoding="utf-8")
-            updated = re.sub(
-                r"^default_version\s*=.*$",
-                f"default_version = '{target_version}'",
-                content,
-                flags=re.MULTILINE,
-            )
-            control_file.write_text(updated, encoding="utf-8")
-            print(f"✅ Updated default_version to '{target_version}' in {control_file}")
-
-    if not preserve_fragments:
-        for fragment in fragments:
-            print(f"Removing consumed fragment: {fragment.name}")
-            fragment.unlink()
-    else:
-        print(f"Preserved unreleased SQL fragment(s) in {unreleased_dir}.")
+        command.append("--update-control")
+    # pgrx refuses to overwrite an existing migration, including on release reruns.
+    subprocess.run(command, cwd=repo_root, check=True)
 
 
 # ==============================================================================
@@ -721,6 +606,29 @@ def update_digitalocean_version(repo_root, clean_ver):
     install_file.write_text(content, encoding="utf-8")
 
 
+def update_changelog_indexing(repo_root, version, is_latest):
+    """Keep only the latest release notes indexable, including on main sync."""
+    changelog_dir, _, _ = get_changelog_dirs(repo_root)
+    target = changelog_dir / f"{version}.mdx"
+    if not target.is_file():
+        raise FileNotFoundError(f"Missing release notes: {target}")
+
+    pages = changelog_dir.glob("*.mdx") if is_latest else [target]
+    for page in pages:
+        if not re.fullmatch(r"\d+\.\d+\.\d+", page.stem):
+            continue
+        content = page.read_text(encoding="utf-8")
+        parts = content.split("---", 2)
+        if len(parts) != 3 or parts[0]:
+            raise ValueError(f"Missing changelog frontmatter: {page}")
+        frontmatter = re.sub(r"^noindex:.*\n?", "", parts[1], flags=re.MULTILINE)
+        if not (is_latest and page == target):
+            frontmatter = frontmatter.rstrip("\n") + "\nnoindex: true\n"
+        updated = "---" + frontmatter + "---" + parts[2]
+        if updated != content:
+            page.write_text(updated, encoding="utf-8")
+
+
 def assemble_changelog_files(
     repo_root, clean_ver, preserve_fragments=False, is_latest=True
 ):
@@ -738,6 +646,7 @@ def assemble_changelog_files(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"✅ Generated changelog: {output_path}")
+    update_changelog_indexing(repo_root, clean_ver, is_latest)
 
     if docs_json.exists():
         update_docs_json(docs_json, clean_ver, is_latest, repo_root=repo_root)
@@ -838,8 +747,7 @@ def generate_approval_body(
     rel_changelog_path = (changelog_dir / f"{clean_ver}.mdx").relative_to(repo_root)
 
     changelog_body = get_rendered_changelog_body(repo_root, clean_ver)
-    template = dedent(
-        """\
+    template = dedent("""\
         Please review and approve the release of **ParadeDB `v{clean_ver}`**.
 
         ### 📋 Release Details
@@ -867,8 +775,7 @@ def generate_approval_body(
 
         - To **approve** this release, comment `approved` on this issue.
         - To **deny** this release, comment `denied` on this issue.
-        """
-    )
+        """)
 
     return template.format(
         clean_ver=clean_ver,
@@ -921,6 +828,7 @@ def handle_changelog_command(args, repo_root):
     clean_ver = clean_version(target_version)
 
     if args.register_only:
+        update_changelog_indexing(repo_root, clean_ver, args.is_latest)
         docs_json = repo_root / "docs" / "docs.json"
         if docs_json.exists():
             update_docs_json(docs_json, clean_ver, args.is_latest, repo_root=repo_root)
@@ -998,261 +906,39 @@ def handle_approval_body_command(args, repo_root):
 # ==============================================================================
 
 
-def extract_statements_and_objects(content):
-    """Extract (statement_type, object_signature, raw_stmt) from SQL content."""
-    no_comments = re.sub(r"--[^\n]*", "", content)
-    no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL)
-    no_comments = re.sub(r"\\\w+[^\n]*", "", no_comments)
-
-    results = []
-    for s in no_comments.split(";"):
-        stmt = " ".join(s.split()).strip()
-        if not stmt:
-            continue
-
-        m = re.match(
-            r"^(CREATE(?:\s+OR\s+REPLACE)?|ALTER|DROP)\s+([A-Z\s]+?)\s+"
-            r"(?:IF\s+EXISTS\s+)?([^\s(]+)(?:\s*\((.*?)\))?",
-            stmt,
-            re.IGNORECASE,
-        )
-        if m:
-            verb, obj_type, name, args = m.groups()
-            name = name.replace('"', "").lower()
-            obj_type = " ".join(obj_type.upper().split())
-
-            if args is not None and obj_type in (
-                "FUNCTION",
-                "AGGREGATE",
-                "PROCEDURE",
-            ):
-                arg_types = []
-                for a in args.split(","):
-                    a = re.sub(r"(?i)\s+(DEFAULT|=)\s+.*$", "", a).strip()
-                    parts = a.split()
-                    if parts:
-                        t = parts[-1].replace('"', "").lower()
-                        arg_types.append(t)
-                sig = f"{obj_type} {name}({', '.join(arg_types)})"
-            else:
-                sig = f"{obj_type} {name}"
-
-            results.append((verb.upper(), sig, stmt))
-
-    return results
-
-
-def catalog_unreleased_objects(unreleased_dir, before_pr=None):
-    """Map object_signature -> owning PR number from existing unreleased fragments."""
-    object_map = {}
-    if not unreleased_dir.exists():
-        return object_map
-
-    for f in sorted(unreleased_dir.glob("*.sql")):
-        if f.name == ".gitkeep":
-            continue
-        pr_num = parse_pr_number(f.name)
-        if pr_num == 0 or (before_pr is not None and pr_num >= before_pr):
-            continue
-
-        try:
-            with open(f, "r", encoding="utf-8") as fp:
-                content = fp.read()
-            for verb, sig, _ in extract_statements_and_objects(content):
-                if "CREATE" in verb or "REPLACE" in verb:
-                    object_map[sig] = pr_num
-        except OSError as e:
-            print(f"⚠️ Warning: Could not read {f}: {e}", file=sys.stderr)
-
-    return object_map
-
-
 def is_release_branch(branch_name):
     """Check if branch name corresponds to a release branch (e.g. 0.25.x)."""
     return bool(re.match(r"^v?\d+\.\d+\.x$", branch_name))
 
 
-def get_changed_fragment_files(repo_root, base_sha):
-    """Identify fragment files added or modified in the PR."""
-    unreleased_dir = repo_root / "pg_search" / "sql" / "unreleased"
-    diff_ref = base_sha
-
-    if not diff_ref:
-        for ref in ["origin/main", "main", "HEAD~1"]:
-            try:
-                mb = (
-                    subprocess.check_output(
-                        ["git", "merge-base", ref, "HEAD"],
-                        cwd=repo_root,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    .decode()
-                    .strip()
-                )
-                if mb:
-                    diff_ref = mb
-                    break
-            except subprocess.SubprocessError:
-                continue
-
-    if diff_ref:
-        try:
-            res = subprocess.run(
-                [
-                    "git",
-                    "diff",
-                    "--name-only",
-                    "--diff-filter=AM",
-                    f"{diff_ref}...HEAD",
-                    "--",
-                    "pg_search/sql/unreleased/*.sql",
-                ],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            changed = []
-            for line in res.stdout.strip().splitlines():
-                line = line.strip()
-                if line:
-                    changed.append(Path(line).name)
-            if changed:
-                return changed
-        except subprocess.SubprocessError:
-            pass
-
-    return [f.name for f in unreleased_dir.glob("*.sql") if f.name != ".gitkeep"]
+def lint_sql_fragments(repo_root, base_sha=None, *, upstream_ref=None):
+    """Run `cargo pgrx migrate check` on SQL scripts and fragments."""
+    command = [
+        "cargo",
+        "pgrx",
+        "migrate",
+        "check",
+        "--package",
+        "pg_search",
+        "--deny-mixed-objects",
+        "--format",
+        "github",
+    ]
+    if base_sha:
+        command.extend(["--base", base_sha])
+    if upstream_ref:
+        command.extend(["--upstream", upstream_ref])
+    return int(subprocess.run(command, cwd=repo_root, check=False).returncode != 0)
 
 
-def _check_single_main_fragment(fpath, unreleased_dir):
-    current_pr = parse_pr_number(fpath.name)
-    object_map = catalog_unreleased_objects(unreleased_dir, before_pr=current_pr)
-
-    content = fpath.read_text(encoding="utf-8")
-    declared_deps = parse_depends_on(content)
-
-    detected_unreleased_deps = set()
-    has_released_objects = False
-    touched_objects = []
-
-    for _verb, sig, _stmt in extract_statements_and_objects(content):
-        if sig in object_map and object_map[sig] != current_pr:
-            detected_unreleased_deps.add(object_map[sig])
-            touched_objects.append((sig, f"unreleased (PR #{object_map[sig]})"))
-        elif sig not in object_map:
-            has_released_objects = True
-            touched_objects.append((sig, "released"))
-
-    errors = 0
-    for dep_pr in detected_unreleased_deps:
-        if dep_pr not in declared_deps and str(dep_pr) not in declared_deps:
-            print(
-                f"::error file={fpath}::Fragment touches unreleased object(s) "
-                f"from PR #{dep_pr} but does not declare '-- depends-on: {dep_pr}'.",
-                file=sys.stderr,
-            )
-            print(
-                f"❌ {fpath.name}: Must declare '-- depends-on: {dep_pr}' in a header comment.",
-                file=sys.stderr,
-            )
-            errors += 1
-
-    if has_released_objects and detected_unreleased_deps:
-        print(
-            f"::error file={fpath}::Fragment mixes modifications to already-released objects "
-            f"with objects from unreleased PR(s) {sorted(detected_unreleased_deps)}.",
-            file=sys.stderr,
-        )
-        print(
-            f"❌ {fpath.name}: Contains mixed dependencies:\n"
-            + "\n".join(f"  - {sig} [{status}]" for sig, status in touched_objects)
-            + "\nMixing released and unreleased objects in a single fragment breaks backports "
-            "to stable branches.\nPlease split this into separate fragment files:\n"
-            f"  1. A fragment for released objects (no unreleased dependencies)\n"
-            f"  2. A separate fragment declaring '-- depends-on: {min(detected_unreleased_deps)}' "
-            "for the unreleased objects.",
-            file=sys.stderr,
-        )
-        errors += 1
-
-    if len(detected_unreleased_deps) > 1:
-        print(
-            f"::error file={fpath}::Fragment touches objects from multiple distinct "
-            f"unreleased PRs: {sorted(detected_unreleased_deps)}.",
-            file=sys.stderr,
-        )
-        print(
-            f"❌ {fpath.name}: Split this into separate fragment files for each unreleased PR.",
-            file=sys.stderr,
-        )
-        errors += 1
-
-    return errors
-
-
-def lint_main_branch_fragments(repo_root, base_sha):
-    """Lint fragments on PRs targeting main."""
-    unreleased_dir = repo_root / "pg_search" / "sql" / "unreleased"
-    changed_files = get_changed_fragment_files(repo_root, base_sha)
-
-    if not changed_files:
-        print("✅ No unreleased SQL fragments modified in this PR.")
+def lint_release_branch_changelog_fragments(repo_root):
+    """Verify unreleased changelog fragments on a release branch match origin/main."""
+    _, unreleased_cl_dir, _ = get_changelog_dirs(repo_root)
+    if not unreleased_cl_dir.exists():
         return 0
 
-    print(f"Linting {len(changed_files)} fragment(s) on main: {changed_files}")
-
     errors = 0
-    for fname in changed_files:
-        fpath = unreleased_dir / fname
-        if fpath.exists():
-            errors += _check_single_main_fragment(fpath, unreleased_dir)
-
-    return errors
-
-
-def _check_branch_fragment_dependencies(repo_root, unreleased_sql_dir, base_ref):
-    errors = 0
-    for fpath in unreleased_sql_dir.glob("*.sql"):
-        if fpath.name == ".gitkeep":
-            continue
-        with open(fpath, "r", encoding="utf-8") as fp:
-            content = fp.read()
-        deps = parse_depends_on(content)
-        for dep in deps:
-            if isinstance(dep, int):
-                check = subprocess.run(
-                    ["git", "log", "-n", "1", f"--grep=#{dep}\\b", f"--grep=({dep})"],
-                    cwd=repo_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if not check.stdout.strip():
-                    print(
-                        f"::error file={fpath}::Fragment declares '-- depends-on: {dep}', "
-                        f"but PR #{dep} has not been backported to this branch ({base_ref}).",
-                        file=sys.stderr,
-                    )
-                    print(
-                        f"❌ {fpath.name}: Dependency PR #{dep} is missing from {base_ref}. "
-                        "Drop this fragment from the backport.",
-                        file=sys.stderr,
-                    )
-                    errors += 1
-    return errors
-
-
-def _check_branch_fragment_identity(repo_root, all_fragments):
-    subprocess.run(
-        ["git", "fetch", "origin", "main"],
-        cwd=repo_root,
-        capture_output=True,
-        check=False,
-    )
-
-    errors = 0
-    for fpath in all_fragments:
+    for fpath in sorted(unreleased_cl_dir.glob("*.mdx")):
         if fpath.name == ".gitkeep":
             continue
         rel_path = fpath.relative_to(repo_root)
@@ -1304,22 +990,6 @@ def _check_branch_fragment_identity(repo_root, all_fragments):
                 file=sys.stderr,
             )
             errors += 1
-    return errors
-
-
-def lint_release_branch_fragments(repo_root, base_ref):
-    """Lint fragments on PRs targeting a stable release branch (e.g. 0.25.x)."""
-    unreleased_sql_dir = repo_root / "pg_search" / "sql" / "unreleased"
-    _, unreleased_cl_dir, _ = get_changelog_dirs(repo_root)
-
-    all_fragments = list(unreleased_sql_dir.glob("*.sql")) + list(
-        unreleased_cl_dir.glob("*.mdx")
-    )
-
-    errors = _check_branch_fragment_dependencies(
-        repo_root, unreleased_sql_dir, base_ref
-    )
-    errors += _check_branch_fragment_identity(repo_root, all_fragments)
     return errors
 
 
@@ -1414,15 +1084,26 @@ def handle_lint_fragments_command(args, repo_root):
 
     print(f"Linting fragments with base_ref='{args.base_ref}' at {repo_root}")
 
+    on_release_branch = is_release_branch(args.base_ref)
+    if on_release_branch:
+        subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+
     errors = 0
     if not changelog_only:
-        if is_release_branch(args.base_ref):
-            errors += lint_release_branch_fragments(repo_root, args.base_ref)
-        else:
-            errors += lint_main_branch_fragments(repo_root, args.base_sha)
+        upstream_ref = "origin/main" if on_release_branch else None
+        errors += lint_sql_fragments(
+            repo_root, args.base_sha, upstream_ref=upstream_ref
+        )
 
     if not sql_only:
         errors += lint_changelog_fragments(repo_root)
+        if on_release_branch:
+            errors += lint_release_branch_changelog_fragments(repo_root)
 
     if errors > 0:
         print(f"\n❌ Fragment lint failed with {errors} error(s).", file=sys.stderr)
@@ -1441,6 +1122,13 @@ def build_parser():
     )
     subparsers = parser.add_subparsers(
         dest="command", required=True, help="Subcommand to execute"
+    )
+
+    latest_sql_parser = subparsers.add_parser(
+        "latest-sql-version", help="Print the newest SQL migration target"
+    )
+    latest_sql_parser.add_argument(
+        "--released", action="store_true", help="Only consider tagged releases"
     )
 
     sql_parser = subparsers.add_parser("sql", help="Assemble SQL migration scripts")
@@ -1476,7 +1164,7 @@ def build_parser():
     cl_parser.add_argument(
         "--register-only",
         action="store_true",
-        help="Only update docs navigation and installation examples",
+        help="Only update docs navigation, release indexing, and installation examples",
     )
     cl_parser.add_argument(
         "--is-latest",
@@ -1589,6 +1277,7 @@ def main():
     repo_root = Path(args.repo_root or default_root)
 
     commands = {
+        "latest-sql-version": handle_latest_sql_version_command,
         "sql": handle_sql_command,
         "changelog": handle_changelog_command,
         "all": handle_all_command,

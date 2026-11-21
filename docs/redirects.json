@@ -1,7 +1,7 @@
 [
   {
-    "source": "/operate/deploy/logical-replication/configuration",
-    "destination": "/operate/deploy/logical-replication/schema-changes"
+    "source": "/operate/deploy/third-party-extensions",
+    "destination": "/operate/deploy/self-hosted/extension"
   },
   {
     "source": "/operate/deploy/ci/gitlab-ci",

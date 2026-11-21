@@ -79,7 +79,6 @@ struct EphemeralPostgres {
     pub port: u16,
     pub dbname: String,
     pub pg_ctl_path: PathBuf,
-    pub log_path: PathBuf,
 }
 
 // Implement Drop trait to ensure the PostgreSQL instance is properly stopped
@@ -170,7 +169,6 @@ impl EphemeralPostgres {
             port,
             dbname: "postgres".to_string(),
             pg_ctl_path,
-            log_path: PathBuf::from(logfile),
         }
     }
 
@@ -639,15 +637,35 @@ async fn test_physical_streaming_replication() -> Result<()> {
     Ok(())
 }
 
+/// `query` fails with SQLSTATE 0A000 and a message containing `fragment`.
+fn assert_feature_not_supported(connection: &mut PgConnection, query: &str, fragment: &str) {
+    let Err(err) = query.execute_result(connection) else {
+        panic!("query on a ParadeDB index must fail: {query}");
+    };
+    let db_err = match &err {
+        sqlx::Error::Database(db_err) => db_err,
+        other => panic!("expected a database error, got {other:?}"),
+    };
+    assert_eq!(db_err.code().as_deref(), Some("0A000"), "{db_err}");
+    assert!(
+        db_err.message().contains(fragment),
+        "unexpected message: {}",
+        db_err.message()
+    );
+}
+
 #[rstest]
 #[async_std::test]
 async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
     // Primary Postgres setup + insert data
+    // wal_consistency_checking makes the standby compare every page a record touches with the
+    // primary's image; the taint set during replay must live where no record ever looks.
     let postgresql_conf = "
         listen_addresses = 'localhost'
         wal_level = replica
         max_wal_senders = 4
         shared_preload_libraries = 'pg_search'
+        wal_consistency_checking = 'all'
         # It's often helpful to have a short wal_keep_size or max_wal_senders for testing
     ";
     let pg_hba_conf = "
@@ -683,6 +701,22 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         ('4K television', 'Electronics', NOW())"
         .execute(&mut source_conn);
 
+    // Indexes built before the standby is cloned: the clone carries their files and replays no
+    // build record for them. A VACUUM or ANALYZE on the primary names them to the standby,
+    // whether or not VACUUM finds a dead row.
+    "
+    CREATE TABLE early (id INT, body TEXT);
+    INSERT INTO early VALUES (1, 'early shoes'), (2, 'early boots');
+    CREATE INDEX early_idx ON early USING paradedb (id, body);
+    CREATE TABLE append_only (id INT, body TEXT);
+    INSERT INTO append_only VALUES (1, 'appended shoes');
+    CREATE INDEX append_only_idx ON append_only USING paradedb (id, body);
+    CREATE TABLE analyzed (id INT, body TEXT);
+    INSERT INTO analyzed VALUES (1, 'analyzed shoes');
+    CREATE INDEX analyzed_idx ON analyzed USING paradedb (id, body);
+    "
+    .execute(&mut source_conn);
+
     // Set up the standby using pg_basebackup
     let target_tempdir = TempDir::new().expect("Failed to create temp dir for standby");
     let target_tempdir_path = target_tempdir.keep();
@@ -701,7 +735,7 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         --host localhost
         --port $source_port
         --username $source_username
-        -Fp -Xs -P -R
+        -Fp -Xs -P -R --checkpoint=fast
         &> /dev/null
     )
     .expect("Failed to run pg_basebackup for standby setup");
@@ -729,311 +763,165 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
     );
     assert_eq!(standby_rows.len(), 4);
 
-    // ambuild emits the rmgr 137 marker. Community rejects it; the fork's
-    // experimental physical-failover build must replay it without stopping recovery.
+    // Build a ParadeDB index on the primary. ambuild logs the index pages and then emits the
+    // rmgr 137 INIT_INDEX record; replaying that record must not stop recovery (#6007).
     "
     CREATE INDEX items_search_idx ON items
     USING paradedb (id, description, category);
     "
     .execute(&mut source_conn);
 
-    // This opt-in must only be used against a library built with
-    // `experimental-physical-failover`; the test below proves it really replays WAL,
-    // rejects standby search reads, and uses the copied index after promotion.
-    if std::env::var("PG_SEARCH_TEST_PHYSICAL_FAILOVER").as_deref() == Ok("1") {
-        return test_pg_search_physical_failover(
-            &source_postgres,
-            &standby_postgres,
-            &mut source_conn,
-            &mut standby_conn,
-        )
-        .await;
-    }
+    // A partitioned index has no storage of its own; each leaf refuses on its own after promotion.
+    "
+    CREATE TABLE events (id INT, body TEXT, region INT) PARTITION BY LIST (region);
+    CREATE TABLE events_1 PARTITION OF events FOR VALUES IN (1);
+    CREATE TABLE events_2 PARTITION OF events FOR VALUES IN (2);
+    INSERT INTO events VALUES (1, 'quarterly shoes sale', 1), (2, 'winter shoes', 2);
+    CREATE INDEX events_idx ON events USING paradedb (id, body);
+    "
+    .execute(&mut source_conn);
 
-    // Wait for the marker to stream to the standby and FATAL its recovery process. Poll the
-    // log instead of sleeping for a fixed duration so the test self-paces.
-    let expected = "replicas are not supported on community and require paradedb enterprise";
-    let log_path = standby_postgres.log_path.clone();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut tripwire_found = false;
-    while std::time::Instant::now() < deadline {
-        if let Ok(log) = std::fs::read_to_string(&log_path)
-            && log.contains(expected)
-        {
-            tripwire_found = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    assert!(
-        tripwire_found,
-        "expected standby log {log_path:?} to contain tripwire message {expected:?}"
+    // Two rounds on `early`, so the primary rewrites its metapage twice after the taint and the
+    // standby compares both images. `append_only` gives VACUUM no dead row. `analyzed` is only
+    // analyzed.
+    "DELETE FROM early WHERE id = 2".execute(&mut source_conn);
+    "VACUUM early".execute(&mut source_conn);
+    "INSERT INTO early VALUES (3, 'early sandals')".execute(&mut source_conn);
+    "DELETE FROM early WHERE id = 3".execute(&mut source_conn);
+    "VACUUM early".execute(&mut source_conn);
+    "INSERT INTO append_only VALUES (2, 'appended boots')".execute(&mut source_conn);
+    "VACUUM append_only".execute(&mut source_conn);
+    "ANALYZE analyzed".execute(&mut source_conn);
+
+    // Replay continues past the records: heap WAL written after them still arrives.
+    "INSERT INTO items (description, category, created_at) VALUES
+        ('Green hiking shoes', 'Footwear', NOW())"
+        .execute(&mut source_conn);
+    let standby_rows: Vec<(String,)> = "SELECT description FROM items ORDER BY id".fetch_retry(
+        &mut standby_conn,
+        RETRIES,
+        RETRY_DELAY,
+        |result| result.len() == 5,
+    );
+    assert_eq!(standby_rows[4].0, "Green hiking shoes");
+
+    // Using the index on the standby fails with a targeted error, and only that statement fails.
+    assert_feature_not_supported(
+        &mut standby_conn,
+        "SELECT description FROM items WHERE description ||| 'shoes'",
+        "Serving reads from a standby requires write-ahead log (WAL) integration",
+    );
+    let standby_rows: Vec<(String,)> =
+        "SELECT description FROM items WHERE category = 'Footwear' ORDER BY id"
+            .fetch(&mut standby_conn);
+    assert_eq!(standby_rows.len(), 3);
+    // An admin function opens the index without going through the planner; the metapage
+    // refuses it.
+    assert_feature_not_supported(
+        &mut standby_conn,
+        "SELECT name FROM paradedb.schema('items_search_idx')",
+        "Serving reads from a standby requires write-ahead log (WAL) integration",
     );
 
-    // The FATAL during recovery should also have brought the standby down: reconnects fail.
-    let reconnect = PgConnection::connect(&format!(
-        "postgresql://{}@{}:{}/{}",
-        SUPERUSER, standby_postgres.host, standby_postgres.port, standby_postgres.dbname
-    ))
-    .await;
-    assert!(
-        reconnect.is_err(),
-        "expected reconnect to dead standby to fail, got {reconnect:?}"
+    // A refused query on the standby does not disturb replay.
+    "INSERT INTO items (description, category, created_at) VALUES
+        ('Bluetooth speaker', 'Electronics', NOW())"
+        .execute(&mut source_conn);
+    let standby_rows: Vec<(String,)> = "SELECT description FROM items ORDER BY id".fetch_retry(
+        &mut standby_conn,
+        RETRIES,
+        RETRY_DELAY,
+        |result| result.len() == 6,
+    );
+    assert_eq!(standby_rows[5].0, "Bluetooth speaker");
+
+    // Promote. The backend behind `standby_conn` lives through it.
+    let pg_ctl_path = &standby_postgres.pg_ctl_path;
+    let standby_dir = &standby_postgres.tempdir_path;
+    run_cmd!($pg_ctl_path -D $standby_dir promote -w &> /dev/null).expect("Failed to promote");
+    "SELECT pg_is_in_recovery()".fetch_retry::<(bool,)>(
+        &mut standby_conn,
+        RETRIES,
+        RETRY_DELAY,
+        |result| result.first().is_some_and(|(in_recovery,)| !in_recovery),
     );
 
-    Ok(())
-}
-
-// Wait for WAL, not row counts or a fixed sleep: index, merge, and VACUUM records
-// must have replayed too. Each poll is a fresh autocommit snapshot.
-async fn wait_for_replay(primary: &mut PgConnection, standby: &mut PgConnection) -> Result<()> {
-    let lsn: String = sqlx::query_scalar("SELECT pg_current_wal_flush_lsn()::text")
-        .fetch_one(primary)
-        .await?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let caught_up: bool = sqlx::query_scalar(
-            "SELECT COALESCE(pg_last_wal_replay_lsn() >= $1::text::pg_lsn, false)",
-        )
-        .bind(&lsn)
-        .fetch_one(&mut *standby)
-        .await?;
-        if caught_up {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "standby did not replay through {lsn}"
-        );
-        async_std::task::sleep(Duration::from_millis(50)).await;
+    // The tainted indexes refuse queries on the promoted server, with a REINDEX hint. Three of
+    // them predate the clone; the VACUUM and ANALYZE records are what tainted them.
+    for query in [
+        "SELECT description FROM items WHERE description ||| 'shoes'",
+        "SELECT id FROM items WHERE description @@@ 'shoes'",
+        "SELECT body FROM events WHERE body ||| 'shoes'",
+        "SELECT body FROM events_1 WHERE body ||| 'shoes'",
+        "SELECT body FROM early WHERE body ||| 'shoes'",
+        "SELECT body FROM append_only WHERE body ||| 'shoes'",
+        "SELECT body FROM analyzed WHERE body ||| 'shoes'",
+    ] {
+        assert_feature_not_supported(&mut standby_conn, query, "has since been promoted");
     }
-}
 
-async fn test_pg_search_physical_failover(
-    primary: &EphemeralPostgres,
-    standby: &EphemeralPostgres,
-    primary_conn: &mut PgConnection,
-    standby_conn: &mut PgConnection,
-) -> Result<()> {
-    let capability: String = sqlx::query_scalar("SHOW paradedb.physical_failover")
-        .fetch_one(&mut *primary_conn)
-        .await?;
-    assert_eq!(capability, "on");
-    let capability: String = sqlx::query_scalar("SHOW paradedb.physical_failover")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert_eq!(capability, "on");
-    // Ordinary relations must continue to stream after INIT_INDEX, including an
-    // ordinary index on a different table. An empty search index also emits a marker.
-    primary_conn
-        .execute("CREATE TABLE ordinary (id int PRIMARY KEY, value text)")
-        .await?;
-    primary_conn
-        .execute("CREATE INDEX ordinary_value_idx ON ordinary (value)")
-        .await?;
-    primary_conn
-        .execute("INSERT INTO ordinary VALUES (1, 'after index creation')")
-        .await?;
-    primary_conn
-        .execute("CREATE TABLE empty_items (id bigint, body text)")
-        .await?;
-    primary_conn
-        .execute("CREATE INDEX empty_items_idx ON empty_items USING paradedb (id, body)")
-        .await?;
-    wait_for_replay(primary_conn, standby_conn).await?;
-    let ordinary: String = sqlx::query_scalar("SELECT value FROM ordinary WHERE id = 1")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert_eq!(ordinary, "after index creation");
+    // The table itself keeps working, reads and writes alike, and so do the admin functions
+    // on the tainted index.
+    let count: Vec<(i64,)> = "SELECT count(*) FROM items".fetch(&mut standby_conn);
+    assert_eq!(count[0].0, 6);
+    let fields: Vec<(String,)> =
+        "SELECT name FROM paradedb.schema('items_search_idx')".fetch(&mut standby_conn);
+    assert!(!fields.is_empty());
+    "INSERT INTO items (description, category, created_at) VALUES
+        ('Promoted insert', 'Misc', NOW())"
+        .execute(&mut standby_conn);
+    let count: Vec<(i64,)> = "SELECT count(*) FROM items".fetch(&mut standby_conn);
+    assert_eq!(count[0].0, 7);
 
-    // No hot-standby search reads: a query error must not kill recovery, poison the
-    // connection, or allow a planner/admin path to initialize legacy metadata.
-    let error = standby_conn
-        .execute("SELECT id FROM items WHERE description ||| 'shoes'")
-        .await
-        .expect_err("standby search must fail cleanly");
-    let error = error
-        .as_database_error()
-        .expect("expected a PostgreSQL error");
-    assert_eq!(error.code().as_deref(), Some("0A000"));
-    assert!(error.message().contains("cannot be read during recovery"));
-    let recovering: bool = sqlx::query_scalar("SELECT pg_is_in_recovery()")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert!(recovering);
-
-    // Exercise mutable segments, full-page images, Generic WAL, aborted inserts,
-    // updates, deletes, COPY, VACUUM, immutable segments, and index rebuilds.
-    for batch in 0..4 {
-        sqlx::query("INSERT INTO items (description, category) SELECT 'replicated shoes ' || i, 'batch' FROM generate_series($1::int, $1::int + 127) s(i)")
-            .bind(batch * 128).execute(&mut *primary_conn).await?;
+    // REINDEX builds a fresh index on this server, which clears the mark. On a partitioned
+    // index it rebuilds every leaf.
+    for (index, query, matches) in [
+        (
+            "items_search_idx",
+            "SELECT description FROM items WHERE description ||| 'shoes'",
+            3,
+        ),
+        (
+            "events_idx",
+            "SELECT body FROM events WHERE body ||| 'shoes'",
+            2,
+        ),
+        (
+            "early_idx",
+            "SELECT body FROM early WHERE body ||| 'shoes'",
+            1,
+        ),
+        (
+            "append_only_idx",
+            "SELECT body FROM append_only WHERE body ||| 'shoes'",
+            1,
+        ),
+        (
+            "analyzed_idx",
+            "SELECT body FROM analyzed WHERE body ||| 'shoes'",
+            1,
+        ),
+    ] {
+        format!("REINDEX INDEX {index}").execute(&mut standby_conn);
+        let rows: Vec<(String,)> = query.fetch(&mut standby_conn);
+        assert_eq!(rows.len(), matches, "{index}");
     }
-    primary_conn
-        .execute("BEGIN; INSERT INTO items (description) VALUES ('rolled back shoes'); ROLLBACK")
-        .await?;
-    primary_conn
-        .execute("UPDATE items SET description = 'updated headphones' WHERE id = 3")
-        .await?;
-    primary_conn
-        .execute("DELETE FROM items WHERE id = 4 OR id % 7 = 0")
-        .await?;
-    let mut copy = primary_conn
-        .copy_in_raw("COPY items(description, category) FROM STDIN")
-        .await?;
-    copy.send("copied shoes\tcopy\ncopied headphones\tcopy\n".as_bytes())
-        .await?;
-    copy.finish().await?;
-    primary_conn.execute("VACUUM items").await?;
-    primary_conn
-        .execute("ALTER INDEX items_search_idx SET (mutable_segment_rows = 0)")
-        .await?;
-    for _ in 0..4 {
-        primary_conn.execute("INSERT INTO items (description, category) SELECT 'immutable shoes ' || i, 'immutable' FROM generate_series(1, 128) s(i)").await?;
-    }
-    primary_conn.execute("VACUUM items").await?;
-    // Rebuild a separate index so REINDEX cannot hide missing incremental WAL
-    // for items_search_idx. The promoted items index is never rebuilt in this test.
-    primary_conn
-        .execute("CREATE TABLE rebuilt_items (id bigint, body text)")
-        .await?;
-    primary_conn
-        .execute("INSERT INTO rebuilt_items VALUES (1, 'rebuilt shoes')")
-        .await?;
-    primary_conn
-        .execute("CREATE INDEX rebuilt_items_idx ON rebuilt_items USING paradedb (id, body)")
-        .await?;
-    primary_conn
-        .execute("REINDEX INDEX CONCURRENTLY rebuilt_items_idx")
-        .await?;
-    primary_conn
-        .execute("INSERT INTO rebuilt_items VALUES (2, 'after rebuild shoes')")
-        .await?;
-    primary_conn.execute("CHECKPOINT").await?;
-    wait_for_replay(primary_conn, standby_conn).await?;
 
-    let expected: Vec<(i32, String)> =
-        sqlx::query_as("SELECT id, description FROM items ORDER BY id")
-            .fetch_all(&mut *primary_conn)
-            .await?;
-    let actual: Vec<(i32, String)> =
-        sqlx::query_as("SELECT id, description FROM items ORDER BY id")
-            .fetch_all(&mut *standby_conn)
-            .await?;
-    assert_eq!(
-        actual, expected,
-        "heap WAL must still replay after index maintenance"
-    );
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM items")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert_eq!(count, expected.len() as i64);
-    let joined: i64 = sqlx::query_scalar("SELECT count(*) FROM items JOIN ordinary USING (id)")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert_eq!(joined, 1);
-    standby_conn
-        .execute("EXPLAIN SELECT id FROM items WHERE id = 1")
-        .await?;
+    // An index built after promotion is usable at once.
+    "CREATE TABLE after_promotion (id SERIAL PRIMARY KEY, body TEXT)".execute(&mut standby_conn);
+    "INSERT INTO after_promotion (body) VALUES ('built after promotion')"
+        .execute(&mut standby_conn);
+    "CREATE INDEX after_promotion_idx ON after_promotion USING paradedb (id, body)"
+        .execute(&mut standby_conn);
+    let rows: Vec<(String,)> =
+        "SELECT body FROM after_promotion WHERE body ||| 'promotion'".fetch(&mut standby_conn);
+    assert_eq!(rows.len(), 1);
 
-    // A standby restart must replay to consistency with the exact same extension.
-    let ctl = &standby.pg_ctl_path;
-    let data = &standby.tempdir_path;
-    let log = &standby.log_path;
-    run_cmd!($ctl -D $data -l $log restart -m fast)?;
-    *standby_conn = standby.connection().await?;
-    primary_conn
-        .execute("INSERT INTO items (description) VALUES ('before failover shoes')")
-        .await?;
-    primary_conn
-        .execute("UPDATE ordinary SET value = 'still replicating' WHERE id = 1")
-        .await?;
-    wait_for_replay(primary_conn, standby_conn).await?;
+    // The old primary never ran as a standby and is untouched.
+    let rows: Vec<(String,)> =
+        "SELECT description FROM items WHERE description ||| 'shoes'".fetch(&mut source_conn);
+    assert_eq!(rows.len(), 3);
 
-    let expected_all: Vec<(i32, String)> =
-        sqlx::query_as("SELECT id, description FROM items ORDER BY id")
-            .fetch_all(&mut *primary_conn)
-            .await?;
-    let expected_shoes: Vec<(i32,)> =
-        sqlx::query_as("SELECT id FROM items WHERE description ||| 'shoes' ORDER BY id")
-            .fetch_all(&mut *primary_conn)
-            .await?;
-
-    // Replay index changes belonging to a transaction that will never commit.
-    // Promotion must preserve committed rows and never expose these documents.
-    let mut pending = primary.connection().await?;
-    pending.execute("BEGIN").await?;
-    pending
-        .execute("INSERT INTO items (description) VALUES ('uncommitted shoes')")
-        .await?;
-    pending
-        .execute("UPDATE items SET description = 'uncommitted replacement' WHERE id = 1")
-        .await?;
-    pending.execute("DELETE FROM items WHERE id = 3").await?;
-    primary_conn.execute("CHECKPOINT").await?;
-    wait_for_replay(primary_conn, standby_conn).await?;
-
-    // Simulate the database-level operation Patroni performs. No REINDEX on the
-    // promoted node is permitted: these assertions must use the copied index.
-    let ctl = &primary.pg_ctl_path;
-    let data = &primary.tempdir_path;
-    run_cmd!($ctl -D $data stop -m immediate)?;
-    let ctl = &standby.pg_ctl_path;
-    let data = &standby.tempdir_path;
-    run_cmd!($ctl -D $data promote -w -t 60)?;
-
-    let recovering: bool = sqlx::query_scalar("SELECT pg_is_in_recovery()")
-        .fetch_one(&mut *standby_conn)
-        .await?;
-    assert!(!recovering);
-    let actual_all: Vec<(i32, String)> =
-        sqlx::query_as("SELECT id, description FROM items WHERE id @@@ pdb.all() ORDER BY id")
-            .fetch_all(&mut *standby_conn)
-            .await?;
-    assert_eq!(
-        actual_all, expected_all,
-        "copied index must cover the heap after promotion"
-    );
-    let actual_shoes: Vec<(i32,)> =
-        sqlx::query_as("SELECT id FROM items WHERE description ||| 'shoes' ORDER BY id")
-            .fetch_all(&mut *standby_conn)
-            .await?;
-    assert_eq!(actual_shoes, expected_shoes);
-    let empty_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM empty_items WHERE body ||| 'shoes'")
-            .fetch_one(&mut *standby_conn)
-            .await?;
-    assert_eq!(empty_count, 0);
-    let rebuilt_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM rebuilt_items WHERE body ||| 'shoes'")
-            .fetch_one(&mut *standby_conn)
-            .await?;
-    assert_eq!(rebuilt_count, 2);
-
-    standby_conn
-        .execute("INSERT INTO items (description) VALUES ('promoted shoes')")
-        .await?;
-    standby_conn
-        .execute("UPDATE items SET description = 'promoted headphones' WHERE id = 3")
-        .await?;
-    standby_conn
-        .execute("DELETE FROM items WHERE id = 2")
-        .await?;
-    standby_conn.execute("VACUUM items").await?;
-    let promoted: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM items WHERE description ||| 'promoted'")
-            .fetch_one(&mut *standby_conn)
-            .await?;
-    assert_eq!(promoted, 2);
-    let passed: Option<bool> = sqlx::query_scalar(
-        "SELECT bool_and(passed) FROM pdb.verify_index('items_search_idx', heapallindexed => true)",
-    )
-    .fetch_one(&mut *standby_conn)
-    .await?;
-    assert_eq!(
-        passed,
-        Some(true),
-        "copied index must verify after promoted writes and VACUUM"
-    );
     Ok(())
 }
 
@@ -1168,7 +1056,7 @@ async fn test_ephemeral_background_merge_releases_merged_segment_pins() -> Resul
     let (before,): (i64,) = sqlx::query_as(segments).fetch_one(&mut conn).await?;
     conn.execute("ALTER INDEX merge_pins_idx SET (background_layer_sizes = '1kb,10kb,64kb')")
         .await?;
-    // There are no mutable segments, so no backpressure: this insert launches the merger.
+    // This insert launches the background merger.
     conn.execute("INSERT INTO merge_pins VALUES (500, 'beer wine cheese 500')")
         .await?;
 
@@ -1193,10 +1081,7 @@ async fn test_ephemeral_background_merge_releases_merged_segment_pins() -> Resul
     Ok(())
 }
 
-// With more than 2 mutable segments an insert is under backpressure and merges them in the
-// foreground. With no foreground layers configured that merge leaves the immutable segments
-// alone, so the insert must still launch the background merger, or concurrent writers keep it
-// from ever running (paradedb/paradedb#6796).
+// Backpressure must not prevent an available background worker from starting.
 #[async_std::test]
 async fn test_ephemeral_insert_under_backpressure_launches_background_merger() -> Result<()> {
     let postgres = EphemeralPostgres::new(
@@ -1209,7 +1094,7 @@ async fn test_ephemeral_insert_under_backpressure_launches_background_merger() -
         .await?;
     conn.execute(
         "CREATE INDEX merge_launch_idx ON merge_launch USING paradedb (id, body) \
-         WITH (background_layer_sizes = '0', target_segment_count = 1)",
+         WITH (background_layer_sizes = '0', target_segment_count = 4)",
     )
     .await?;
     // Immutable segments, which only the background merger merges.
@@ -1234,10 +1119,10 @@ async fn test_ephemeral_insert_under_backpressure_launches_background_merger() -
     let immutable =
         "SELECT count(*) FROM paradedb.index_info('merge_launch_idx') WHERE NOT mutable";
     let (before,): (i64,) = sqlx::query_as(immutable).fetch_one(&mut conn).await?;
-    conn.execute("ALTER INDEX merge_launch_idx SET (background_layer_sizes = '1kb,10kb,64kb')")
+    conn.execute("ALTER INDEX merge_launch_idx SET (background_layer_sizes = '1mb')")
         .await?;
-    // A third mutable segment puts this insert under backpressure.
-    conn.execute("INSERT INTO merge_launch VALUES (4, 'single row')")
+    // The next inserts leave three frozen mutable segments eligible for backpressure.
+    conn.execute("INSERT INTO merge_launch VALUES (4, 'single row'); INSERT INTO merge_launch VALUES (5, 'single row'); INSERT INTO merge_launch VALUES (6, 'single row')")
         .await?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1258,5 +1143,444 @@ async fn test_ephemeral_insert_under_backpressure_launches_background_merger() -
     .fetch_one(&mut conn)
     .await?;
     anyhow::ensure!(passed == Some(true), "verify_index failed after the merge");
+    Ok(())
+}
+
+#[async_std::test]
+async fn test_ephemeral_mutable_backpressure_preserves_immutable_segments() -> Result<()> {
+    let postgres = EphemeralPostgres::new(
+        Some("shared_preload_libraries = 'pg_search'\nmax_worker_processes = 0\nautovacuum = off"),
+        None,
+    );
+    let mut conn = postgres.connection().await?;
+    conn.execute(
+        "CREATE EXTENSION pg_search CASCADE;
+        CREATE TABLE backpressure (id bigint, body text);
+        CREATE INDEX backpressure_idx ON backpressure USING paradedb (id, body)
+        WITH (target_segment_count=4, mutable_segment_rows=0, background_layer_sizes='0')",
+    )
+    .await?;
+    for id in 0..12_i64 {
+        sqlx::query("INSERT INTO backpressure VALUES ($1, 'beer wine cheese')")
+            .bind(id)
+            .execute(&mut conn)
+            .await?;
+    }
+    let immutable = "SELECT segno FROM paradedb.index_info('backpressure_idx') WHERE NOT mutable";
+    let before: Vec<String> = sqlx::query_scalar(immutable).fetch_all(&mut conn).await?;
+    anyhow::ensure!(before.len() == 12, "expected 12 immutable segments");
+    conn.execute("ALTER INDEX backpressure_idx SET (mutable_segment_rows=1)")
+        .await?;
+    for id in 12..16_i64 {
+        sqlx::query("INSERT INTO backpressure VALUES ($1, 'beer wine cheese')")
+            .bind(id)
+            .execute(&mut conn)
+            .await?;
+    }
+    let mutable = "SELECT count(*) FROM paradedb.index_info('backpressure_idx') WHERE mutable";
+    let mutable_before: i64 = sqlx::query_scalar(mutable).fetch_one(&mut conn).await?;
+    anyhow::ensure!(mutable_before == 2, "expected two mutable segments");
+    // Use a layer larger than this fixture so target-size clamping groups enough
+    // immutable segments to include original segments. With 1KB batches, the newly
+    // frozen segment can repeatedly merge with new inserts instead.
+    conn.execute(
+        "ALTER INDEX backpressure_idx SET (background_layer_sizes='20kb,100mb');
+        INSERT INTO backpressure VALUES (16, 'beer wine cheese');
+        INSERT INTO backpressure VALUES (17, 'beer wine cheese');
+        INSERT INTO backpressure VALUES (18, 'beer wine cheese')",
+    )
+    .await?;
+    let after: Vec<String> = sqlx::query_scalar(immutable).fetch_all(&mut conn).await?;
+    anyhow::ensure!(
+        before.iter().all(|id| after.contains(id)),
+        "mutable backpressure merged immutable segments"
+    );
+    let mutable_after: i64 = sqlx::query_scalar(mutable).fetch_one(&mut conn).await?;
+    anyhow::ensure!(mutable_after < 3, "mutable segments were not merged");
+    conn.execute(
+        "ALTER INDEX backpressure_idx SET (target_segment_count=1, mutable_segment_rows=0);
+        INSERT INTO backpressure VALUES (19, 'beer wine cheese')",
+    )
+    .await?;
+    conn.execute("INSERT INTO backpressure VALUES (20, 'beer wine cheese')")
+        .await?;
+    let merged: Vec<String> = sqlx::query_scalar(immutable).fetch_all(&mut conn).await?;
+    anyhow::ensure!(
+        before.iter().any(|id| !merged.contains(id)),
+        "immutable backpressure did not merge immutable segments"
+    );
+    let passed: Option<bool> = sqlx::query_scalar(
+        "SELECT bool_and(passed) FROM pdb.verify_index('backpressure_idx', heapallindexed => true)",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    anyhow::ensure!(
+        passed == Some(true),
+        "verify_index failed after backpressure"
+    );
+    Ok(())
+}
+
+#[async_std::test]
+async fn test_ephemeral_immutable_backpressure_with_one_mutable_segment() -> Result<()> {
+    let postgres = EphemeralPostgres::new(
+        Some("shared_preload_libraries = 'pg_search'\nmax_worker_processes = 0\nautovacuum = off"),
+        None,
+    );
+    let mut conn = postgres.connection().await?;
+    conn.execute(
+        "CREATE EXTENSION pg_search CASCADE;
+        CREATE TABLE backpressure (id bigint, body text);
+        CREATE INDEX backpressure_idx ON backpressure USING paradedb (id, body)
+        WITH (target_segment_count=2, mutable_segment_rows=0, background_layer_sizes='0')",
+    )
+    .await?;
+    for id in 0..12_i64 {
+        sqlx::query("INSERT INTO backpressure VALUES ($1, 'beer wine cheese')")
+            .bind(id)
+            .execute(&mut conn)
+            .await?;
+    }
+    conn.execute(
+        "ALTER INDEX backpressure_idx SET (mutable_segment_rows=1);
+        INSERT INTO backpressure VALUES (12, 'beer wine cheese');
+        INSERT INTO backpressure VALUES (13, 'beer wine cheese')",
+    )
+    .await?;
+    let segments = "SELECT count(*) FROM paradedb.index_info('backpressure_idx') WHERE visible";
+    let before: i64 = sqlx::query_scalar(segments).fetch_one(&mut conn).await?;
+    anyhow::ensure!(
+        before == 13,
+        "expected 12 immutable segments and one mutable"
+    );
+    conn.execute(
+        "ALTER INDEX backpressure_idx SET (background_layer_sizes='1kb,10kb,100kb');
+        INSERT INTO backpressure VALUES (14, 'beer wine cheese')",
+    )
+    .await?;
+    let after: i64 = sqlx::query_scalar(segments).fetch_one(&mut conn).await?;
+    anyhow::ensure!(
+        after <= before,
+        "immutable backpressure did not offset the new segment: {before} -> {after}"
+    );
+    let passed: Option<bool> = sqlx::query_scalar(
+        "SELECT bool_and(passed) FROM pdb.verify_index('backpressure_idx', heapallindexed => true)",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    anyhow::ensure!(
+        passed == Some(true),
+        "verify_index failed after backpressure"
+    );
+    Ok(())
+}
+
+#[async_std::test]
+async fn test_ephemeral_backpressure_merges_each_statement_in_transaction() -> Result<()> {
+    let postgres = EphemeralPostgres::new(
+        Some("shared_preload_libraries = 'pg_search'\nmax_worker_processes = 0\nautovacuum = off"),
+        None,
+    );
+    let mut conn = postgres.connection().await?;
+    conn.execute(
+        "CREATE EXTENSION pg_search CASCADE;
+        CREATE TABLE backpressure (id bigint, body text);
+        CREATE INDEX backpressure_idx ON backpressure USING paradedb (id, body)
+        WITH (target_segment_count=2, mutable_segment_rows=0, background_layer_sizes='0')",
+    )
+    .await?;
+    for id in 0..40_i64 {
+        sqlx::query("INSERT INTO backpressure VALUES ($1, 'beer wine cheese')")
+            .bind(id)
+            .execute(&mut conn)
+            .await?;
+    }
+    conn.execute("ALTER INDEX backpressure_idx SET (background_layer_sizes='1kb,10kb,100kb')")
+        .await?;
+    let count_segments = "SELECT count(*) FROM paradedb.index_info('backpressure_idx')";
+    conn.execute("BEGIN; INSERT INTO backpressure VALUES (40, 'beer wine cheese')")
+        .await?;
+    let first: i64 = sqlx::query_scalar(count_segments)
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(first < 41, "the first insert did not merge");
+    conn.execute("INSERT INTO backpressure VALUES (41, 'beer wine cheese')")
+        .await?;
+    let second: i64 = sqlx::query_scalar(count_segments)
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(
+        second <= first,
+        "the second statement in the same transaction did not merge"
+    );
+    conn.execute("COMMIT").await?;
+    conn.execute("INSERT INTO backpressure VALUES (42, 'beer wine cheese')")
+        .await?;
+    let third: i64 = sqlx::query_scalar(count_segments)
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(
+        third <= second,
+        "the next transaction did not resume merging"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM backpressure WHERE id @@@ pdb.all()")
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(count == 43, "unexpected indexed row count: {count}");
+    let passed: Option<bool> = sqlx::query_scalar(
+        "SELECT bool_and(passed) FROM pdb.verify_index('backpressure_idx', heapallindexed => true)",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    anyhow::ensure!(
+        passed == Some(true),
+        "verify_index failed after backpressure"
+    );
+    Ok(())
+}
+
+#[async_std::test]
+async fn test_ephemeral_small_immutable_backpressure_merges_concurrent_writes() -> Result<()> {
+    const TARGET_SEGMENT_COUNT: i64 = 8;
+    const WRITERS: i64 = 8;
+    let postgres = EphemeralPostgres::new(
+        Some(
+            "shared_preload_libraries = 'pg_search'\nshared_buffers = '128MB'\nmax_worker_processes = 0\nautovacuum = off\nstatement_timeout = '30s'",
+        ),
+        None,
+    );
+    let mut conn = postgres.connection().await?;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE EXTENSION pg_search CASCADE;
+        CREATE TABLE backpressure (id bigint PRIMARY KEY, body text);
+        CREATE INDEX backpressure_idx ON backpressure USING paradedb (id, body)
+        WITH (target_segment_count={TARGET_SEGMENT_COUNT}, mutable_segment_rows=0,
+              background_layer_sizes='1kb,10kb,100kb')",
+    )))
+    .await?;
+    let mut writers = Vec::new();
+    for writer in 0..WRITERS {
+        let mut writer_conn = postgres.connection().await?;
+        writers.push(async_std::task::spawn(async move {
+            for row in 0..120_i64 {
+                sqlx::query("INSERT INTO backpressure VALUES ($1, 'beer wine cheese')")
+                    .bind(writer * 120 + row)
+                    .execute(&mut writer_conn)
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+    for writer in writers {
+        writer.await?;
+    }
+    let layer_counts: Vec<(i64, i64)> = sqlx::query_as(
+        "WITH segments AS (
+            SELECT byte_size,
+                   CASE WHEN byte_size <= 1024 THEN 1024
+                        WHEN byte_size <= 10240 THEN 10240 ELSE 102400 END AS layer_size
+            FROM paradedb.index_info('backpressure_idx') WHERE NOT mutable
+         )
+         SELECT count(*), floor((layer_size + layer_size / 3 - 1) / min(byte_size))::bigint
+         FROM segments GROUP BY layer_size",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+    // The trigger counts complete merge batches; allow one partial batch and in-flight writers.
+    anyhow::ensure!(
+        layer_counts
+            .iter()
+            .all(|(count, partial_batch)| *count
+                <= 4 * TARGET_SEGMENT_COUNT + WRITERS + partial_batch),
+        "segment counts and partial-batch allowances per layer reached {layer_counts:?}"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM backpressure WHERE id @@@ pdb.all()")
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(
+        count == WRITERS * 120,
+        "unexpected indexed row count: {count}"
+    );
+    let passed: Option<bool> = sqlx::query_scalar(
+        "SELECT bool_and(passed) FROM pdb.verify_index('backpressure_idx', heapallindexed => true)",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    anyhow::ensure!(
+        passed == Some(true),
+        "verify_index failed after backpressure"
+    );
+    Ok(())
+}
+
+// Index conversion must conflict with old replica snapshots even when a heap-page
+// pin prevented pruning from logging its usual snapshot-conflict WAL record.
+#[rstest]
+#[async_std::test]
+#[ignore = "requires Enterprise WAL replay and standby index reads"]
+async fn test_replica_snapshot_conflicts_with_dead_mutable_content() -> Result<()> {
+    let config = "
+        listen_addresses = 'localhost'
+        shared_preload_libraries = 'pg_search'
+        wal_level = replica
+        max_wal_senders = 5
+        max_replication_slots = 5
+        wal_keep_size = '256MB'
+        autovacuum = off
+        paradedb.mutable_sweep_interval = 600000
+    ";
+    let primary = EphemeralPostgres::new(Some(config), None);
+    let mut source = primary.connection().await?;
+    sqlx::raw_sql(
+        "CREATE EXTENSION pg_search CASCADE;
+        CREATE TABLE test(id bigint PRIMARY KEY,message text);
+        INSERT INTO test SELECT id,CASE WHEN id IN (1,2,3,4,8,9,10,11)
+          THEN 'beer a' ELSE 'wine a' END FROM generate_series(1,14) id;
+        CREATE INDEX idxtest ON test USING paradedb(id,message)
+          WITH(key_field='id',mutable_segment_rows=32,layer_sizes='10kb,100kb,1mb',
+               background_layer_sizes='10kb,100kb,1mb');
+        UPDATE test SET message=replace(message,' a',' v1') WHERE id<10;",
+    )
+    .execute(&mut source)
+    .await?;
+    let mutable_id: String =
+        sqlx::query_scalar("SELECT segno::text FROM paradedb.index_info('idxtest') WHERE mutable")
+            .fetch_one(&mut source)
+            .await?;
+
+    let clone = |slot: &str| {
+        let directory = TempDir::new().unwrap().keep();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backup = EphemeralPostgres::pg_basebackup_path();
+        let port = primary.port;
+        run_cmd!($backup -D $directory -h localhost -p $port -U $SUPERUSER
+                 -Xs -R -C -S $slot --checkpoint=fast &> /dev/null)
+        .unwrap();
+        let replica_config = format!(
+            "{config}\n hot_standby=on\n hot_standby_feedback=on\n
+            max_standby_streaming_delay='100ms'\n wal_retrieve_retry_interval='100ms'"
+        );
+        EphemeralPostgres::new_from_initialized(&directory, Some(&replica_config), None)
+    };
+    let candidate = clone("candidate_slot");
+    let replica = clone("reader_slot");
+    let mut old_reader = replica.connection().await?;
+    // Establish only a heap snapshot: an index reader could pin the old segment
+    // and block replacement WAL, masking the missing conflict record.
+    sqlx::raw_sql(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+        SET LOCAL max_parallel_workers_per_gather=0;",
+    )
+    .execute(&mut old_reader)
+    .await?;
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM test WHERE message LIKE '%beer%'")
+        .fetch_one(&mut old_reader)
+        .await?;
+    assert_eq!(before, 8);
+
+    let ctl = primary.pg_ctl_path.clone();
+    let directory = &primary.tempdir_path;
+    run_cmd!($ctl -D $directory -m fast -w stop &> /dev/null)?;
+    let directory = &candidate.tempdir_path;
+    run_cmd!($ctl -D $directory -w promote &> /dev/null)?;
+    let mut promoted = candidate.connection().await?;
+    sqlx::query("UPDATE test SET message=replace(message,'v1','v2') WHERE id<10")
+        .execute(&mut promoted)
+        .await?;
+    let mut heap_pin = candidate.connection().await?;
+    sqlx::raw_sql(
+        "SET enable_indexscan=off; SET enable_indexonlyscan=off;
+        SET enable_bitmapscan=off; BEGIN;
+        DECLARE heap_pin CURSOR FOR SELECT id FROM test; FETCH 1 FROM heap_pin;",
+    )
+    .execute(&mut heap_pin)
+    .await?;
+    // The promoted primary has no feedback from the remaining replica yet.
+    // These inserts freeze and convert the segment containing the old versions.
+    for batch in 0..8_i64 {
+        sqlx::query(
+            "INSERT INTO test SELECT id,'Z' FROM generate_series($1::bigint,$2::bigint) id",
+        )
+        .bind(100 + batch * 32)
+        .bind(131 + batch * 32)
+        .execute(&mut promoted)
+        .await?;
+        thread::sleep(Duration::from_millis(200));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let old_visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM paradedb.index_info('idxtest') WHERE segno::text=$1",
+        )
+        .bind(&mutable_id)
+        .fetch_one(&mut promoted)
+        .await?;
+        if old_visible == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mutable segment was not converted"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let target_lsn: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+        .fetch_one(&mut promoted)
+        .await?;
+    sqlx::query("SELECT pg_create_physical_replication_slot('reader_slot',true)")
+        .execute(&mut promoted)
+        .await?;
+    let mut control = replica.connection().await?;
+    let candidate_port = candidate.port;
+    control
+        .execute(sqlx::AssertSqlSafe(format!(
+            "ALTER SYSTEM SET primary_conninfo =
+        'host=localhost port={candidate_port} user=postgres application_name=count_reader'"
+        )))
+        .await?;
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(&mut control)
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let caught_up =
+            sqlx::query_scalar::<_, bool>("SELECT pg_last_wal_replay_lsn()>=$1::text::pg_lsn")
+                .bind(&target_lsn)
+                .fetch_one(&mut control)
+                .await;
+        match caught_up {
+            Ok(true) => break,
+            Ok(false) => (),
+            Err(_) => control = replica.connection().await?,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica did not replay the conversion"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM test WHERE id @@@ 'message:beer'")
+        .fetch_one(&mut old_reader)
+        .await
+    {
+        Ok(count) => assert_eq!(count, 8, "old replica snapshot silently lost matches"),
+        Err(error) => assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("40001"),
+            "unexpected replica error: {error}"
+        ),
+    }
+    let mut fresh = replica.connection().await?;
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+        (SELECT count(*) FROM test WHERE message LIKE '%beer%'),
+        (SELECT count(*) FROM test WHERE id @@@ 'message:beer')",
+    )
+    .fetch_one(&mut fresh)
+    .await?;
+    assert_eq!(counts, (8, 8));
     Ok(())
 }

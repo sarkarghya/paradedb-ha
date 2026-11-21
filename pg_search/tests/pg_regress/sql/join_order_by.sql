@@ -233,9 +233,10 @@ ORDER BY random(), t1.id
 LIMIT 5;
 
 -- =============================================================================
--- TEST 2.7: Volatile expression Postgres can't project declines JoinScan
+-- TEST 2.7: Volatile expression referencing pdb.score() is projected by Postgres
 -- =============================================================================
--- pdb.score() exists only inside the scan, so the fallback can't take the expression.
+-- pdb.score() is appended to the scan's output so the Postgres projection above
+-- the scan can evaluate the volatile expression once per output row.
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT t1.id, random() * pdb.score(t1.id) AS rand_score
@@ -395,6 +396,8 @@ LIMIT 10;
 -- threshold after the first batch and push it into the scanner (dynamic_filter_pushdown_score=1).
 -- =============================================================================
 
+SET paradedb.enable_rank_join = off;
+
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
 SELECT t1.id, t2.id, paradedb.score(t2.id)
 FROM dyn_filter_t1 t1
@@ -403,6 +406,8 @@ WHERE t1.val ||| 'val'
   AND t2.val ||| 'val'
 ORDER BY paradedb.score(t2.id) DESC, t2.id
 LIMIT 10;
+
+RESET paradedb.enable_rank_join;
 
 -- =============================================================================
 -- TEST 6: Top K dynamic filter does not prune NULLs

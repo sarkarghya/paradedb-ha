@@ -14,6 +14,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use pgrx::*;
 
@@ -243,6 +244,11 @@ pub unsafe fn terms_with_operator(
                     .expect("should return a valid SearchQueryInput")
             })
             .collect::<Vec<_>>();
+
+        if conjunction_mode && quals.is_empty() {
+            // `field <op> ALL('{}')` is true for every row, including NULLs
+            return Ok(SearchQueryInput::All);
+        }
 
         if conjunction_mode {
             // AND the queries together

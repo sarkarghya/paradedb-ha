@@ -1,3 +1,21 @@
+-- Keep segment layouts stable throughout the SQL regression suite.
+ALTER SYSTEM SET paradedb.mutable_sweep_interval = 0;
+DO $$
+BEGIN
+    PERFORM pg_reload_conf();
+    FOR attempt IN 1..100 LOOP
+        PERFORM pg_stat_clear_snapshot();
+        IF NOT EXISTS (
+            SELECT FROM pg_stat_activity
+            WHERE backend_type = 'pg_search mutable sweep'
+        ) THEN
+            RETURN;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+    RAISE EXCEPTION 'mutable segment flushing workers did not stop';
+END
+$$;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_search;
 
@@ -77,5 +95,19 @@ BEGIN
         RAISE EXCEPTION '% <> %: %', coalesce(a, '<NULL>'), coalesce(b, '<NULL>'), message;
     END IF;
     RETURN true;
+END;
+$$;
+
+/*
+ EXPLAINs a query with index OIDs masked. Plans that fall back to a heap filter embed the BM25
+ index OID, which changes on every database creation.
+ */
+CREATE FUNCTION explain_redact_oid(query text, options text DEFAULT 'COSTS OFF, TIMING OFF') RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+    line text;
+BEGIN
+    FOR line IN EXECUTE 'EXPLAIN (' || options || ') ' || query LOOP
+        RETURN NEXT regexp_replace(line, '"oid":\d+', '"oid":N', 'g');
+    END LOOP;
 END;
 $$;

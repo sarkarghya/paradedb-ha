@@ -18,7 +18,7 @@ whereas writes can be improved by increasing [per-statement memory](/operate/per
 
 ### Correctness vs. Performance
 
-By default, ParadeDB favors correctness, even when it comes at the cost of slower query execution. For [facets](/reference/aggregates/facets), transaction visibility filtering is enabled by default. If your workload can tolerate potentially stale aggregate results, you can skip it with `visibility => 'raw'` to improve performance, or let the query's size determine whether to apply visibility filtering with `visibility => 'threshold'`.
+By default, ParadeDB favors correctness, even when it comes at the cost of slower query execution. For [facets](/reference/aggregates/facets), transaction visibility filtering is enabled by default. If your workload can tolerate potentially stale aggregate results, you can skip it with `visibility => 'raw'` to improve performance, or let the query's size determine whether to apply visibility filtering with `visibility => 'threshold'`. A read that skips the heap records no dependency on a write that committed before it and that its snapshot cannot see. That holds for `'raw'` always, and for `'threshold'` above the estimate.
 
 ### Replication Safety
 
@@ -31,7 +31,7 @@ Physical replication refers to running ParadeDB itself in a multi-node, high-ava
 [ParadeDB Community](https://github.com/paradedb/paradedb) supports logical replication, but not physical replication:
 
 - It can act as a logical replica, ingesting changes from a Postgres primary and indexing them transactionally.
-- The ParadeDB index does not get physically replicated and won't be available on other nodes in a high availability setup.
+- The ParadeDB index does not get physically replicated and won't be available on other nodes in a high availability setup. After a failover, the promoted server needs a `REINDEX` before the index can be queried.
 
 [ParadeDB Enterprise](/operate/deploy/enterprise) supports both:
 

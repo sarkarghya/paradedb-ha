@@ -5,6 +5,10 @@ set -euo pipefail
 # If you don't want check the snippets for all languages at once, pass in the list you'd like to check:
 # scripts/smoke_test_code_snippets.sh sql rails
 ORMS=${*:-'sql django sqlalchemy rails drizzle efcore'}
+
+has_target() {
+  [[ " $ORMS " == *" $1 "* ]]
+}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 VERIFY_DIR="${SCRIPT_DIR}/verify"
@@ -75,10 +79,17 @@ run_psql_file() {
     printf '%s\n' "$output" >&2
   fi
 
-  # Published 0.25 docs require key_field; the 0.26 test extension warns on it.
-  # TODO: Remove this exception once key_field is removed from the docs.
-  if grep -E '(^|:) WARNING:' <<<"$output" |
-    grep -Ev 'WARNING:  key_field is deprecated as of 0\.26\.0 and is a no-op; it no longer needs to be provided$' >/dev/null; then
+  if [[ -f "${sql_file%.sql}.warning" ]]; then
+    local expected_warning
+    expected_warning="$(cat "${sql_file%.sql}.warning")"
+    if ! grep -F "$expected_warning" <<<"$output" >/dev/null; then
+      echo "Expected documented planner warning was not emitted: $expected_warning" >&2
+      return 1
+    fi
+    output="$(grep -Fv "$expected_warning" <<<"$output" || true)"
+  fi
+
+  if grep -E '(^|:) WARNING:' <<<"$output" >/dev/null; then
     return 1
   fi
 }
@@ -91,13 +102,20 @@ drop_snippet_indexes() {
   run_psql_file "${SCRIPT_DIR}/drop_code_snippet_indexes.sql"
 }
 
-python3 "${SCRIPT_DIR}/extract_code_snippets.py" >/dev/null
+# The bootstrap drops the synonym tables, and the ORM snippets of the synonyms page read them.
+create_snippet_synonyms() {
+  run_psql_file "${VERIFY_DIR}/fixtures/synonyms.sql"
+}
+
+python3 "${SCRIPT_DIR}/extract_code_snippets.py"
+
+# Make the external-index fixtures available to every ORM harness.
+run_psql_file "${SQL_DIR}/reference__filtering__external-indexes__fence-001.sql"
+run_psql_file "${SQL_DIR}/reference__filtering__external-indexes__fence-012.sql"
 
 sql_pass_count=0
 sql_fail_count=0
-if [[ $ORMS =~ "sql" ]]; then
-  run_psql_file "${SCRIPT_DIR}/bootstrap_code_snippet_tables.sql"
-
+if has_target sql; then
   while IFS= read -r snippet_file; do
     rel_snippet="${snippet_file#"$REPO_ROOT"/}"
 
@@ -117,9 +135,11 @@ if [[ $ORMS =~ "sql" ]]; then
   done < <(find "$SQL_DIR" -type f -name '*.sql' | LC_ALL=C sort)
 fi
 
+create_snippet_synonyms
+
 django_pass_count=0
 django_fail_count=0
-if [[ $ORMS =~ "django" ]]; then
+if has_target django; then
   if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "Creating temporary Python environment for Python snippet verification..."
     python3 -m venv "$PYTHON_ENV_DIR"
@@ -127,7 +147,7 @@ if [[ $ORMS =~ "django" ]]; then
 
   echo "Installing Django ParadeDB client from PyPI..."
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON_BIN" -m pip install --quiet --upgrade \
-    "django-paradedb==0.13.0" \
+    "django-paradedb==0.16.0" \
     "django-cte>=2.0" \
     "psycopg[binary]"
 
@@ -160,11 +180,11 @@ fi
 
 rails_pass_count=0
 rails_fail_count=0
-if [[ $ORMS =~ "rails" ]]; then
+if has_target rails; then
   echo "Installing rails-paradedb from RubyGems..."
   GEM_HOME="$RUBY_GEM_HOME" GEM_PATH="$RUBY_GEM_HOME" \
     gem install --silent --no-document --install-dir "$RUBY_GEM_HOME" \
-    "rails-paradedb:0.12.0" \
+    "rails-paradedb:0.14.0" \
     "pg" \
     "json:<3"
 
@@ -200,7 +220,7 @@ fi
 
 sqlalchemy_pass_count=0
 sqlalchemy_fail_count=0
-if [[ $ORMS =~ "sqlalchemy" ]]; then
+if has_target sqlalchemy; then
   if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "Creating temporary Python environment for Python snippet verification..."
     python3 -m venv "$PYTHON_ENV_DIR"
@@ -208,7 +228,7 @@ if [[ $ORMS =~ "sqlalchemy" ]]; then
 
   echo "Installing SQLAlchemy ParadeDB client from PyPI..."
   PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON_BIN" -m pip install --quiet --upgrade \
-    "sqlalchemy-paradedb==0.11.0" \
+    "sqlalchemy-paradedb==0.14.0" \
     "psycopg[binary]"
 
   while IFS= read -r snippet_file; do
@@ -222,7 +242,7 @@ if [[ $ORMS =~ "sqlalchemy" ]]; then
 
     if {
       cat <<PY
-from sqlalchemy_snippet_harness import MockItem, Order, ArrayDemo, engine
+from sqlalchemy_snippet_harness import MockItem, MockItemGeo, MockItemPath, Order, ArrayDemo, ShopSynonym, Synonym, engine
 
 # Source: $rel_snippet
 PY
@@ -240,13 +260,14 @@ fi
 
 drizzle_pass_count=0
 drizzle_fail_count=0
-if [[ $ORMS =~ "drizzle" ]]; then
+if has_target drizzle; then
   echo "Installing @paradedb/drizzle-paradedb from npm..."
   # Keep the Drizzle version aligned with the integration's peer dependency.
   # Skip peer resolution for Drizzle's unused optional integrations (e.g. effect).
   npm --prefix "$JAVASCRIPT_ENV_DIR" install --legacy-peer-deps \
-    "@paradedb/drizzle-paradedb@0.5.0" \
+    "@paradedb/drizzle-paradedb@0.7.1" \
     "drizzle-orm@1.0.0-rc.4" \
+    "drizzle-kit@1.0.0-rc.4" \
     "postgres" \
     "tsx"
 
@@ -254,6 +275,7 @@ if [[ $ORMS =~ "drizzle" ]]; then
     rel_snippet="${snippet_file#"$REPO_ROOT"/}"
 
     run_psql_file "${SCRIPT_DIR}/bootstrap_code_snippet_tables.sql"
+    create_snippet_synonyms
     drop_snippet_indexes
 
     if ! grep -Eq 'paradedbIndex|CREATE INDEX' "$snippet_file"; then
@@ -266,6 +288,7 @@ if [[ $ORMS =~ "drizzle" ]]; then
 // Source: $rel_snippet
 TS
       cat "$snippet_file"
+      echo "await verifyDocsIndexes();"
       cat <<'TS'
 
 await client.end();
@@ -283,11 +306,11 @@ fi
 
 efcore_pass_count=0
 efcore_fail_count=0
-if [[ $ORMS =~ "efcore" ]]; then
+if has_target efcore; then
   echo "Installing ParadeDB.EntityFrameworkCore from NuGet..."
   dotnet new console --framework net10.0 --output "$CSHARP_ENV_DIR" >/dev/null
   dotnet add "$CSHARP_ENV_DIR" package ParadeDB.EntityFrameworkCore \
-    --version 0.3.0 \
+    --version 0.5.0 \
     >/dev/null
   dotnet restore "$CSHARP_ENV_DIR" -p:NuGetAudit=false >/dev/null
 
@@ -295,8 +318,9 @@ if [[ $ORMS =~ "efcore" ]]; then
     rel_snippet="${snippet_file#"$REPO_ROOT"/}"
 
     run_psql_file "${SCRIPT_DIR}/bootstrap_code_snippet_tables.sql"
+    create_snippet_synonyms
     drop_snippet_indexes
-    if ! grep -Fq 'CREATE INDEX' "$snippet_file"; then
+    if ! grep -Eq 'CREATE INDEX|modelBuilder\.' "$snippet_file"; then
       create_snippet_indexes
     fi
 
@@ -316,6 +340,12 @@ if [[ $ORMS =~ "efcore" ]]; then
       fi
     done <"${SCRIPT_DIR}/efcore_snippet_harness.cs" >"${CSHARP_ENV_DIR}/Program.cs"
 
+    DOCS_EXPECT_INDEX=false
+    if grep -Fq "modelBuilder." "$snippet_file"; then
+      DOCS_EXPECT_INDEX=true
+    fi
+    export DOCS_EXPECT_INDEX
+
     if dotnet run --no-restore --project "$CSHARP_ENV_DIR"; then
       echo "${GREEN}[SUCCESS]${RESET} $rel_snippet" >&2
       efcore_pass_count=$((efcore_pass_count + 1))
@@ -326,6 +356,9 @@ if [[ $ORMS =~ "efcore" ]]; then
     fi
   done < <(find "$EFCORE_DIR" -type f -name '*.cs' | LC_ALL=C sort)
 fi
+
+read -r -a setup_targets <<<"$ORMS"
+python3 "${SCRIPT_DIR}/smoke_test_getting_started.py" "${setup_targets[@]}"
 
 echo "SQL passed: $sql_pass_count failed: $sql_fail_count"
 echo "Django passed: $django_pass_count failed: $django_fail_count"

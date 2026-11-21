@@ -14,6 +14,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use super::{
     PdbQueryRhs, RHSValue, build_pdb_query_funcexpr, build_text_funcexpr, get_expr_result_type,
@@ -30,7 +31,7 @@ use crate::query::proximity::ProximityClause;
 use pgrx::{IntoDatum, PgList, direct_function_call, pg_sys};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum SearchOperator {
+pub(crate) enum SearchOperator {
     Conjunction,
     Disjunction,
     Term,
@@ -69,24 +70,37 @@ impl SearchOperator {
         }
     }
 
-    pub(super) fn classify_query(self, query: pdb::Query) -> pdb::Query {
+    pub(crate) fn classify_query(self, query: pdb::Query) -> pdb::Query {
         let (query, score) = match query {
             pdb::Query::ScoreAdjusted { query, score } => (*query, Some(score)),
             query => (query, None),
         };
-        let (mut query, fuzzy_data, slop_data) = match query {
+        let (mut query, fuzzy_data, slop_data, synonyms) = match query {
             pdb::Query::UnclassifiedString {
                 string,
                 fuzzy_data,
                 slop_data,
-            } => (self.text_query(string), fuzzy_data, slop_data),
+                synonyms,
+            } => (self.text_query(string), fuzzy_data, slop_data, synonyms),
             pdb::Query::UnclassifiedArray {
                 array,
                 fuzzy_data,
                 slop_data,
-            } if self != Self::Parse => (self.array_query(array), fuzzy_data, slop_data),
-            query => (query, None, None),
+            } if self != Self::Parse => (self.array_query(array), fuzzy_data, slop_data, None),
+            query => (query, None, None, None),
         };
+        if let Some(rules) = synonyms {
+            let (pdb::Query::Match { synonyms, .. }
+            | pdb::Query::TokenizedPhrase { synonyms, .. }
+            | pdb::Query::ParseWithField { synonyms, .. }) = &mut query
+            else {
+                panic!(
+                    "`pdb.expand` expands the `|||`, `&&&`, `###` and `@@@` operators, not `{}`",
+                    self.name()
+                );
+            };
+            *synonyms = Some(rules);
+        }
         if self != Self::Phrase {
             query.apply_fuzzy_data(fuzzy_data);
         }
@@ -178,7 +192,7 @@ impl SearchOperator {
         field: Option<FieldName>,
         lhs: *mut pg_sys::Node,
         rhs: *mut pg_sys::Node,
-    ) -> pg_sys::FuncExpr {
+    ) -> *mut pg_sys::FuncExpr {
         if self == Self::Parse {
             let expr_type = get_expr_result_type(rhs);
             let is_pdb_query = expr_type == pdb_query_typoid();
@@ -212,20 +226,14 @@ impl SearchOperator {
                 args.push(pg_sys::makeBoolConst(false, true));
             }
 
-            return pg_sys::FuncExpr {
-                xpr: pg_sys::Expr {
-                    type_: pg_sys::NodeTag::T_FuncExpr,
-                },
+            return pg_sys::makeFuncExpr(
                 funcid,
-                funcresulttype: searchqueryinput_typoid(),
-                funcretset: false,
-                funcvariadic: false,
-                funcformat: pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
-                funccollid: pg_sys::Oid::INVALID,
-                inputcollid: pg_sys::Oid::INVALID,
-                args: args.into_pg(),
-                location: -1,
-            };
+                searchqueryinput_typoid(),
+                args.into_pg(),
+                pg_sys::Oid::INVALID,
+                pg_sys::Oid::INVALID,
+                pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
+            );
         }
         let field = self.require_field(lhs, field);
         // The runtime classification function mirrors this operator's const-fold path and

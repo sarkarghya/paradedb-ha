@@ -143,6 +143,83 @@ impl Expr {
             Expr::And(l, r) | Expr::Or(l, r) => l.has_null_predicate() || r.has_null_predicate(),
         }
     }
+
+    /// Whether PostgreSQL's `eval_const_expressions` (`negate_clause` in `clauses.c`)
+    /// followed by `find_nonnullable_rels_walker` (`initsplan.c`) concludes that a
+    /// single-table `WHERE` expression forces its relation to be non-nullable (enabling
+    /// `reduce_outer_joins` to reduce `FULL JOIN` to `LEFT JOIN`).
+    ///
+    /// Before `reduce_outer_joins` runs, PostgreSQL's `negate_clause` pushes `NOT` down
+    /// into Negation Normal Form (flipping `AND` <-> `OR`, `IS NULL` <-> `IS NOT NULL`,
+    /// and cancelling `NOT (NOT x)`). Strict operators (`=`, `<>`, `===`, `@@@`) return
+    /// `NULL` on `NULL` inputs regardless of negation (`NOT(NULL)` is still `NULL`), so
+    /// they always mark their relation non-nullable. After NNF normalization, `IS NOT NULL`
+    /// marks its relation non-nullable, `IS NULL` does not, `AND` takes the union (`||`),
+    /// and `OR` takes the intersection (`&&`).
+    pub fn forces_nonnullable(&self) -> bool {
+        self.forces_nonnullable_inner(false)
+    }
+
+    fn forces_nonnullable_inner(&self, negated: bool) -> bool {
+        match self {
+            Expr::Atom { .. } | Expr::All { .. } => true,
+            Expr::IsNotNull(_) => !negated,
+            Expr::IsNull(_) => negated,
+            Expr::Not(e) => e.forces_nonnullable_inner(!negated),
+            Expr::And(l, r) => {
+                if negated {
+                    // De Morgan: NOT (l AND r) => (NOT l) OR (NOT r)
+                    l.forces_nonnullable_inner(true) && r.forces_nonnullable_inner(true)
+                } else {
+                    l.forces_nonnullable_inner(false) || r.forces_nonnullable_inner(false)
+                }
+            }
+            Expr::Or(l, r) => {
+                if negated {
+                    // De Morgan: NOT (l OR r) => (NOT l) AND (NOT r)
+                    l.forces_nonnullable_inner(true) || r.forces_nonnullable_inner(true)
+                } else {
+                    l.forces_nonnullable_inner(false) && r.forces_nonnullable_inner(false)
+                }
+            }
+        }
+    }
+
+    /// True when every leaf is an indexed search `Atom` (`===`) combined with `AND` / `OR` (no
+    /// `NOT`, `IS NULL`, `IS NOT NULL`, or `pdb.all()`), guaranteeing a non-constant BM25 score
+    /// in `ScanMode::Standard`.
+    pub fn is_positive_indexed_search(&self) -> bool {
+        match self {
+            Expr::Atom { is_indexed, .. } => *is_indexed && self.has_search_operator(),
+            Expr::And(l, r) | Expr::Or(l, r) => {
+                l.is_positive_indexed_search() && r.is_positive_indexed_search()
+            }
+            _ => false,
+        }
+    }
+
+    /// True when every leaf is an indexed search `Atom` (`===`) combined only with `OR`, so that
+    /// when combined across tables in a disjunctive `WHERE`, the resulting tag filter is a pure
+    /// `OR` of non-constant-score tag columns eligible for `with_elided_disjunctive_tags`.
+    pub fn is_pure_or_indexed_search(&self) -> bool {
+        match self {
+            Expr::Atom { is_indexed, .. } => *is_indexed && self.has_search_operator(),
+            Expr::Or(l, r) => l.is_pure_or_indexed_search() && r.is_pure_or_indexed_search(),
+            _ => false,
+        }
+    }
+
+    /// True when `self.to_sql(" = ")` lowers to a `0.0`-score pushdown restriction accepted by
+    /// `SearchQueryInput::is_pushdown_filter` (`=`, `IS NOT NULL`, or an `AND` of those on
+    /// indexed literal/fast-field columns).
+    pub fn is_pushdown_filter_shape(&self) -> bool {
+        match self {
+            Expr::Atom { is_indexed, .. } => *is_indexed,
+            Expr::IsNotNull(_) => true,
+            Expr::And(l, r) => l.is_pushdown_filter_shape() && r.is_pushdown_filter_shape(),
+            _ => false,
+        }
+    }
 }
 
 // `tables` is a named generic rather than `impl AsRef<str>` so the return type can use precise
@@ -303,6 +380,45 @@ mod tests {
 
         let and_expr = Expr::And(Box::new(atom), Box::new(not_is_not_null));
         assert!(and_expr.has_null_predicate());
+    }
+
+    #[test]
+    fn test_forces_nonnullable() {
+        let atom = Expr::Atom {
+            name: "users.name".to_string(),
+            value: "'bob'".to_string(),
+            sql_type: "TEXT".to_string(),
+            is_indexed: true,
+        };
+        let is_null = Expr::IsNull("users.name".to_string());
+        let is_not_null = Expr::IsNotNull("users.name".to_string());
+
+        assert!(atom.forces_nonnullable());
+        assert!(Expr::Not(Box::new(atom.clone())).forces_nonnullable());
+        assert!(!is_null.forces_nonnullable());
+        assert!(Expr::Not(Box::new(is_null.clone())).forces_nonnullable());
+        assert!(is_not_null.forces_nonnullable());
+        assert!(!Expr::Not(Box::new(is_not_null.clone())).forces_nonnullable());
+
+        // (users.name === 'bob') OR (users.name IS NULL) does not reject NULLs
+        let or_with_is_null = Expr::Or(Box::new(atom.clone()), Box::new(is_null.clone()));
+        assert!(!or_with_is_null.forces_nonnullable());
+
+        // De Morgan: NOT ((users.name === 'bob') OR (users.name IS NOT NULL))
+        // becomes (NOT (users.name === 'bob')) AND (users.name IS NULL), which IS strict
+        let not_or_with_is_not_null = Expr::Not(Box::new(Expr::Or(
+            Box::new(atom.clone()),
+            Box::new(is_not_null),
+        )));
+        assert!(not_or_with_is_not_null.forces_nonnullable());
+
+        // De Morgan: NOT ((users.name === 'bob') AND (users.name IS NOT NULL))
+        // becomes (NOT (users.name === 'bob')) OR (users.name IS NULL), which is NOT strict
+        let not_and_with_is_not_null = Expr::Not(Box::new(Expr::And(
+            Box::new(atom),
+            Box::new(Expr::IsNotNull("users.name".to_string())),
+        )));
+        assert!(!not_and_with_is_not_null.forces_nonnullable());
     }
 
     proptest! {

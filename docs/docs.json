@@ -15,7 +15,7 @@
   "navigation": {
     "versions": [
       {
-        "version": "v0.26.3",
+        "version": "v0.27.0",
         "tabs": [
           {
             "tab": "Start",
@@ -49,6 +49,7 @@
               {
                 "group": "Indexing",
                 "pages": [
+                  "reference/indexing/schema-modeling",
                   {
                     "group": "Creating an Index",
                     "pages": [
@@ -117,7 +118,8 @@
                         ]
                       },
                       "reference/tokenizers/multiple-per-field",
-                      "reference/tokenizers/search-tokenizer"
+                      "reference/tokenizers/search-tokenizer",
+                      "reference/tokenizers/synonyms"
                     ]
                   },
                   {
@@ -331,18 +333,30 @@
                 "pages": [
                   "project/changelog",
                   {
-                    "group": "v0.26",
+                    "group": "v0.27",
                     "pages": [
-                      "project/changelog/0.26.3",
-                      "project/changelog/0.26.2",
-                      "project/changelog/0.26.1",
-                      "project/changelog/0.26.0"
+                      "project/changelog/0.27.0"
                     ],
                     "expanded": false
                   },
                   {
                     "group": "Older",
                     "pages": [
+                      {
+                        "group": "v0.26",
+                        "pages": [
+                          "project/changelog/0.26.8",
+                          "project/changelog/0.26.7",
+                          "project/changelog/0.26.6",
+                          "project/changelog/0.26.5",
+                          "project/changelog/0.26.4",
+                          "project/changelog/0.26.3",
+                          "project/changelog/0.26.2",
+                          "project/changelog/0.26.1",
+                          "project/changelog/0.26.0"
+                        ],
+                        "expanded": false
+                      },
                       {
                         "group": "v0.25",
                         "pages": [
@@ -632,15 +646,6 @@
       "slack": "https://paradedb.com/slack"
     }
   },
-  "integrations": {
-    "gtm": {
-      "tagId": "GTM-KMGRG564"
-    },
-    "posthog": {
-      "apiKey": "phc_KiWfPSoxQLmFxY5yOODDBzzP3EcyPbn9oSVtsCBbasj",
-      "apiHost": "https://app.posthog.com"
-    }
-  },
   "seo": {
     "metatags": {
       "charset": "UTF-8",
@@ -670,13 +675,13 @@
       "og:locale": "en_US",
       "og:description": "You should just use Postgres.",
       "og:image": "https://www.paradedb.com/opengraph-image.png",
-      "og:image:alt": "ParadeDB: Just use Postgres.",
+      "og:image:alt": "ParadeDB: Just use Postgres",
       "twitter:card": "summary_large_image",
       "twitter:site": "@paradedb",
       "twitter:creator": "@paradedb",
       "twitter:description": "You should just use Postgres.",
       "twitter:image": "https://www.paradedb.com/twitter-image.png",
-      "twitter:image:alt": "ParadeDB: Just use Postgres."
+      "twitter:image:alt": "ParadeDB: Just use Postgres"
     },
     "indexing": "navigable"
   },

@@ -5,9 +5,13 @@
   fetchurl,
   lib,
   lld,
+  llvmPackages,
   nix-update-script,
   pkg-config,
+  openblas,
+  stdenv,
   postgresql,
+  writeShellScriptBin,
 }:
 
 let
@@ -56,6 +60,7 @@ let
     };
   };
 in
+assert cargo-pgrx.version == lib.removePrefix "=" rootCargoToml.workspace.dependencies.pgrx;
 buildPgrxExtension (finalAttrs: {
   pname = "pg_search";
   version = rootCargoToml.workspace.package.version;
@@ -65,9 +70,17 @@ buildPgrxExtension (finalAttrs: {
   # If maintainers forget to do so, Nix will throw an error message that begins
   # like this and then provides the correct new hash:
   # error: hash mismatch in fixed-output derivation '...'
-  cargoHash = "sha256-K/jtTKrekZ07lI/JW37ywIUfFcR/pa/v83jDbb4Lk0g=";
+  cargoHash = "sha256-+YlO7Gxtly3H4sKGyxFx2ylZHCVvUh2IWRAC3lZD8eo=";
 
-  inherit cargo-pgrx postgresql;
+  inherit postgresql;
+  # The Nix builder also passes cargoPgrxFlags to `stop`, which does not accept
+  # packaging flags. Add those only to the package command.
+  cargo-pgrx = writeShellScriptBin "cargo-pgrx" ''
+    if [ "$1" = pgrx ] && [ "$2" = package ]; then
+      set -- "$@" --no-assemble-unreleased --no-distrib-packages
+    fi
+    exec ${cargo-pgrx}/bin/cargo-pgrx "$@"
+  '';
 
   # Lindera dictionaries are copied to a temporary directory and the
   # LINDERA_BUILD_DICTIONARY_CACHE_DIR environment variable prevents the
@@ -90,9 +103,16 @@ buildPgrxExtension (finalAttrs: {
     "pg_search"
   ];
 
-  # .cargo/config.toml links Linux builds with LLD.
+  buildInputs = lib.optionals (!stdenv.hostPlatform.isDarwin) [ openblas ];
+
+  LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+  CLANG_PATH = "${llvmPackages.clang}/bin/clang";
+
+  # Keep the compiler, libclang and archiver on the same LLVM release.
   nativeBuildInputs = [
     lld
+    llvmPackages.clang
+    llvmPackages.llvm
     pkg-config
   ];
 
@@ -102,7 +122,7 @@ buildPgrxExtension (finalAttrs: {
   passthru.updateScript = nix-update-script { };
 
   meta = {
-    description = "Just use Postgres. One Postgres for your application data, full-text search, vector retrieval, and aggregations.";
+    description = "Just use Postgres One Postgres for your application data, full-text search, vector retrieval, and aggregations.";
     homepage = "https://paradedb.com";
     changelog = "https://github.com/paradedb/paradedb/releases/tag/${finalAttrs.version}";
     license = lib.licenses.agpl3Only;

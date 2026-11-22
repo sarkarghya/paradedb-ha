@@ -90,6 +90,8 @@ def main():
         wait_for_replay(leader, replica)
         print(f"Initial primary: {leader}; replica: {replica}", flush=True)
         sql(leader, "CREATE EXTENSION pg_search CASCADE")
+        capability = sql(leader, "SHOW paradedb.physical_failover").stdout.strip()
+        assert capability == "on", f"not a ParadeDB HA build: physical_failover={capability}"
         sql(leader, "CREATE TABLE items (id bigint PRIMARY KEY, body text)")
         sql(leader, "INSERT INTO items SELECT i, 'replicated shoes ' || i FROM generate_series(1, 1000) s(i)")
         sql(leader, "CREATE INDEX items_idx ON items USING paradedb (id, body)")
@@ -100,7 +102,7 @@ def main():
 
         denied = sql(replica, "SELECT id FROM items WHERE body ||| 'shoes'", check=False)
         assert denied.returncode != 0, "Standby search unexpectedly succeeded"
-        assert "0A000" in denied.stderr and "cannot be read during recovery" in denied.stderr, denied.stderr
+        assert "0A000" in denied.stderr and "Serving reads from a standby" in denied.stderr, denied.stderr
         # A rejected search must leave ordinary replication and queries healthy.
         sql(leader, "INSERT INTO items VALUES (10001, 'after rejected standby search shoes')")
         wait_for_replay(leader, replica)

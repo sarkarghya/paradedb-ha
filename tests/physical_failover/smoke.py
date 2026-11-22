@@ -58,16 +58,25 @@ def primary():
 
 
 def wait_for_replay(leader, replica):
-    lsn = sql(leader, "SELECT pg_current_wal_flush_lsn()::text").stdout.strip()
-    # The LSN comes from PostgreSQL, not an external input.
+    lsn, timeline = sql(
+        leader,
+        "SELECT lsn::text, ('x' || substr(pg_walfile_name(lsn), 1, 8))::bit(32)::int"
+        " FROM pg_current_wal_flush_lsn() lsn",
+    ).stdout.strip().split("|")
+    # An LSN alone is not enough: a former primary that has not been rewound
+    # sits past the fork point on the old timeline and compares as caught up.
+    # Require streaming on the leader's timeline. Both values come from PostgreSQL.
     def caught_up():
         result = sql(
             replica,
-            f"SELECT pg_is_in_recovery() AND COALESCE(pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn, false)",
+            "SELECT pg_is_in_recovery()"
+            f" AND COALESCE(pg_last_wal_replay_lsn() >= '{lsn}'::pg_lsn, false)"
+            " AND EXISTS (SELECT FROM pg_stat_wal_receiver"
+            f" WHERE status = 'streaming' AND received_tli = {int(timeline)})",
             check=False,
         )
         return result.returncode == 0 and result.stdout.strip() == "t"
-    wait_for(f"{replica} to replay {lsn}", caught_up)
+    wait_for(f"{replica} to stream timeline {timeline} and replay {lsn}", caught_up)
 
 
 def search_rows(node):

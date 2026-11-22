@@ -474,7 +474,12 @@ impl PgSearchRelation {
     /// recovery, where the standby read gate applies instead, and for a partitioned index, which
     /// has no pages; each leaf answers for itself when it is scanned.
     pub fn blocked_after_promotion(&self) -> bool {
-        if unsafe { pg_sys::RecoveryInProgress() } || is_partitioned_index(self.oid()) {
+        // ParadeDB HA: the replayed pages are the primary's index, so serve them. Replay still
+        // writes the taint, so a stock Community build keeps refusing these files.
+        if common::gucs::PHYSICAL_FAILOVER
+            || unsafe { pg_sys::RecoveryInProgress() }
+            || is_partitioned_index(self.oid())
+        {
             return false;
         }
         // Recovery is over, so the answer cannot change for this index file.

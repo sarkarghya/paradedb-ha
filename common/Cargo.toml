@@ -14,6 +14,9 @@ pg16 = ["pgrx/pg16"]
 pg17 = ["pgrx/pg17"]
 pg18 = ["pgrx/pg18"]
 pg_test = ["dep:proptest"]
+# ParadeDB HA: serve physically replicated BM25 indexes after promotion. Standby reads stay
+# refused. Not ParadeDB Enterprise and not upstream-supported.
+experimental-physical-failover = []
 
 # Keep this crate's dependency list minimal: every workspace crate depends on `common`, so
 # heavy dependencies added here serialize the entire build graph. In particular, do NOT add

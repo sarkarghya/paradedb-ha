@@ -62,6 +62,10 @@ static DISJUNCTION_PRUNING: GucSetting<DisjunctionPruning> =
 /// a `BufFile` temp file on `work_mem` overflow, instead of erroring. Off by default.
 static SPILL_TO_DISK: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// ParadeDB HA build capability: replicated indexes serve queries after promotion.
+pub const PHYSICAL_FAILOVER: bool = cfg!(feature = "experimental-physical-failover");
+static PHYSICAL_FAILOVER_GUC: GucSetting<bool> = GucSetting::<bool>::new(PHYSICAL_FAILOVER);
+
 /// Allows the user to toggle the use of our "ParadeDB Base Scan".
 static ENABLE_CUSTOM_SCAN: GucSetting<bool> = GucSetting::<bool>::new(true);
 
@@ -483,6 +487,15 @@ pub fn init() {
     );
     // Note that Postgres is very specific about the naming convention of variables.
     // They must be namespaced... we use 'paradedb.<variable>' below.
+
+    GucRegistry::define_bool_guc(
+        c"paradedb.physical_failover",
+        c"Whether this build serves replicated ParadeDB indexes after promotion (ParadeDB HA)",
+        c"Read-only build capability. Standby search reads remain unsupported; search is available after promotion without REINDEX.",
+        &PHYSICAL_FAILOVER_GUC,
+        GucContext::Internal,
+        GucFlags::default(),
+    );
 
     GucRegistry::define_bool_guc(
         c"paradedb.spill_to_disk",

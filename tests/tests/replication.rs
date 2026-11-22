@@ -846,18 +846,40 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         |result| result.first().is_some_and(|(in_recovery,)| !in_recovery),
     );
 
-    // The tainted indexes refuse queries on the promoted server, with a REINDEX hint. Three of
-    // them predate the clone; the VACUUM and ANALYZE records are what tainted them.
-    for query in [
-        "SELECT description FROM items WHERE description ||| 'shoes'",
-        "SELECT id FROM items WHERE description @@@ 'shoes'",
-        "SELECT body FROM events WHERE body ||| 'shoes'",
-        "SELECT body FROM events_1 WHERE body ||| 'shoes'",
-        "SELECT body FROM early WHERE body ||| 'shoes'",
-        "SELECT body FROM append_only WHERE body ||| 'shoes'",
-        "SELECT body FROM analyzed WHERE body ||| 'shoes'",
-    ] {
-        assert_feature_not_supported(&mut standby_conn, query, "has since been promoted");
+    // ParadeDB HA (PG_SEARCH_TEST_PHYSICAL_FAILOVER=1, `experimental-physical-failover`
+    // build): the same replicated indexes answer at once, without REINDEX, in the backend that
+    // lived through promotion. Stock Community refuses them with a REINDEX hint.
+    let physical_failover = std::env::var("PG_SEARCH_TEST_PHYSICAL_FAILOVER").as_deref() == Ok("1");
+    let (capability,): (String,) = "SELECT COALESCE(current_setting('paradedb.physical_failover', true), 'off')"
+        .fetch_one(&mut standby_conn);
+    assert_eq!(capability == "on", physical_failover, "build does not match the test mode");
+    let promoted_searches = [
+        ("SELECT description FROM items WHERE description ||| 'shoes'", 3),
+        ("SELECT id::text FROM items WHERE description @@@ 'shoes'", 3),
+        ("SELECT body FROM events WHERE body ||| 'shoes'", 2),
+        ("SELECT body FROM events_1 WHERE body ||| 'shoes'", 1),
+        ("SELECT body FROM early WHERE body ||| 'shoes'", 1),
+        ("SELECT body FROM append_only WHERE body ||| 'shoes'", 1),
+        ("SELECT body FROM analyzed WHERE body ||| 'shoes'", 1),
+    ];
+    if physical_failover {
+        for (query, matches) in promoted_searches {
+            let rows: Vec<(String,)> = query.fetch(&mut standby_conn);
+            assert_eq!(rows.len(), matches, "{query}");
+        }
+        for index in ["items_search_idx", "early_idx", "append_only_idx", "analyzed_idx"] {
+            let (passed,): (Option<bool>,) = format!(
+                "SELECT bool_and(passed) FROM pdb.verify_index('{index}', heapallindexed => true)"
+            )
+            .fetch_one(&mut standby_conn);
+            assert_eq!(passed, Some(true), "{index}");
+        }
+    } else {
+        // The tainted indexes refuse queries on the promoted server, with a REINDEX hint. Three
+        // of them predate the clone; the VACUUM and ANALYZE records are what tainted them.
+        for (query, _) in promoted_searches {
+            assert_feature_not_supported(&mut standby_conn, query, "has since been promoted");
+        }
     }
 
     // The table itself keeps working, reads and writes alike, and so do the admin functions
@@ -872,6 +894,20 @@ async fn test_wal_streaming_replication_with_pg_search() -> Result<()> {
         .execute(&mut standby_conn);
     let count: Vec<(i64,)> = "SELECT count(*) FROM items".fetch(&mut standby_conn);
     assert_eq!(count[0].0, 7);
+
+    // ParadeDB HA: the replicated index takes indexed writes and deletes before any REINDEX.
+    if physical_failover {
+        "INSERT INTO early VALUES (4, 'promoted shoes'); DELETE FROM early WHERE id = 1"
+            .execute(&mut standby_conn);
+        let rows: Vec<(String,)> =
+            "SELECT body FROM early WHERE body ||| 'shoes'".fetch(&mut standby_conn);
+        assert_eq!(rows, vec![("promoted shoes".to_string(),)]);
+        "VACUUM early".execute(&mut standby_conn);
+        let (passed,): (Option<bool>,) =
+            "SELECT bool_and(passed) FROM pdb.verify_index('early_idx', heapallindexed => true)"
+                .fetch_one(&mut standby_conn);
+        assert_eq!(passed, Some(true));
+    }
 
     // REINDEX builds a fresh index on this server, which clears the mark. On a partitioned
     // index it rebuilds every leaf.

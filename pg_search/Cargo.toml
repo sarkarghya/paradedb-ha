@@ -95,6 +95,7 @@ pg_test = [
 # direct dep so the coverage shim survives into the cdylib (see lib.rs)
 dst = ["dst/enabled", "dep:antithesis-instrumentation"]
 unsafe-postgres = ["pgrx/unsafe-postgres"]
+experimental-physical-failover = ["common/experimental-physical-failover"]
 block_tracker = [
   "index_read/block_tracker",
 ] # for debugging when blocks are acquired and released

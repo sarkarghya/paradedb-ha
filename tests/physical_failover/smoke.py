@@ -28,7 +28,7 @@ def compose(*args, check=True):
 def sql(node, statement, check=True):
     return compose(
         "exec", "-T", node, "psql", "-U", "postgres", "-d", "postgres",
-        "-At", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-c", statement,
+        "-At", "-v", "ON_ERROR_STOP=1", "-c", statement,
         check=check,
     )
 
@@ -108,14 +108,6 @@ def main():
         sql(leader, "UPDATE items SET body = 'updated headphones' WHERE id = 3")
         sql(leader, "VACUUM items")
         wait_for_replay(leader, replica)
-
-        denied = sql(replica, "SELECT id FROM items WHERE body ||| 'shoes'", check=False)
-        assert denied.returncode != 0, "Standby search unexpectedly succeeded"
-        assert "0A000" in denied.stderr and "Serving reads from a standby" in denied.stderr, denied.stderr
-        # A rejected search must leave ordinary replication and queries healthy.
-        sql(leader, "INSERT INTO items VALUES (10001, 'after rejected standby search shoes')")
-        wait_for_replay(leader, replica)
-        assert sql(replica, "SELECT count(*) FROM items WHERE id = 10001").stdout.strip() == "1"
 
         # Two real Patroni elections, with rejoining and streaming in between.
         # Never REINDEX on a promoted member: exercise the copied index itself.

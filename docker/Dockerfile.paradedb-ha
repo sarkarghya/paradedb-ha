@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 # ParadeDB HA: PG18 pg_search build with physical failover, plus CI test images.
-ARG BUILDER_IMAGE=builder
 FROM postgres:18-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,9 +26,9 @@ ENV CARGO_BUILD_JOBS=4 CARGO_PROFILE_RELEASE_LTO=false \
 WORKDIR /build
 COPY . .
 ARG TARGETARCH
-RUN --mount=type=cache,id=physical-failover-target-${TARGETARCH},target=/build/target \
-    --mount=type=cache,id=physical-failover-registry-${TARGETARCH},target=/opt/cargo/registry \
-    --mount=type=cache,id=physical-failover-git-${TARGETARCH},target=/opt/cargo/git \
+RUN --mount=type=cache,id=paradedb-ha-target-${TARGETARCH},target=/build/target \
+    --mount=type=cache,id=paradedb-ha-registry-${TARGETARCH},target=/opt/cargo/registry \
+    --mount=type=cache,id=paradedb-ha-git-${TARGETARCH},target=/opt/cargo/git \
     cp Cargo.lock /source-Cargo.lock && \
     cargo pgrx package --no-assemble-unreleased --no-distrib-packages --package pg_search --profile release \
     --features experimental-physical-failover \
@@ -44,14 +43,13 @@ RUN --mount=type=cache,id=physical-failover-target-${TARGETARCH},target=/build/t
     ! nm -D -u /artifacts/usr/lib/postgresql/18/lib/pg_search.so | awk '{print $NF}' | grep -E '^_(ZN|R)'
 
 # Run the real streaming-replication regression against the exact built library.
-FROM ${BUILDER_IMAGE} AS test
-COPY tests/tests/replication.rs /build/tests/tests/replication.rs
+FROM builder AS test
 RUN cp -a /artifacts/. /
 ENV PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config PG_SEARCH_TEST_PHYSICAL_FAILOVER=1
 ARG TARGETARCH
-RUN --mount=type=cache,id=physical-failover-target-${TARGETARCH},target=/build/target \
-    --mount=type=cache,id=physical-failover-registry-${TARGETARCH},target=/opt/cargo/registry \
-    --mount=type=cache,id=physical-failover-git-${TARGETARCH},target=/opt/cargo/git \
+RUN --mount=type=cache,id=paradedb-ha-target-${TARGETARCH},target=/build/target \
+    --mount=type=cache,id=paradedb-ha-registry-${TARGETARCH},target=/opt/cargo/registry \
+    --mount=type=cache,id=paradedb-ha-git-${TARGETARCH},target=/opt/cargo/git \
     cargo test --locked --release --package tests --test replication \
     --no-run && \
     test_binary=$(find target/release -type f -name 'replication-*' -executable -not -name '*.d' | head -n 1) && \

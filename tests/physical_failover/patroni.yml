@@ -15,14 +15,8 @@ bootstrap:
       use_pg_rewind: true
       parameters:
         shared_preload_libraries: pg_search
-        wal_level: replica
-        wal_log_hints: 'on'
-        max_wal_senders: 10
-        max_replication_slots: 10
-        hot_standby: 'on'
   initdb:
     - encoding: UTF8
-    - data-checksums
 postgresql:
   listen: 0.0.0.0:5432
   bin_dir: /usr/lib/postgresql/18/bin

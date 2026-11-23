@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
           cd target/paradedb-ha
           git -C "$GITHUB_WORKSPACE" archive --format=tar HEAD | gzip -n > SOURCE.tar.gz
-          printf 'source=%s\nplatform=linux/%s\npostgres=18\nfeature=experimental-physical-failover\nstandby_search_reads=disabled\n' \
+          printf 'source=%s\nplatform=linux/%s\npostgres=18\nfeature=experimental-physical-failover\n' \
             "$GITHUB_SHA" '${{ matrix.arch }}' > BUILD-INFO
           sed -nE "s/^default_version = '(.*)'$/extension_version=\1/p" \
             usr/share/postgresql/18/extension/pg_search.control >> BUILD-INFO
